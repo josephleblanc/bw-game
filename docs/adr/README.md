@@ -72,3 +72,4 @@ Phasing, pointers to the code that realizes the decision.
 | ADR    | Title                                                     | Status   |
 |--------|-----------------------------------------------------------|----------|
 | 0001   | [Mandatory performance tracking for time and space](0001-mandatory-performance-tracking.md) | Accepted |
+| 0002   | [Adopt Bevy with a contained feature footprint](0002-adopt-bevy-minimal-footprint.md) | Accepted |

@@ -14,14 +14,21 @@ reviewed = "2026-09-22"
 measured_members = ["bw-core", "bw-demo"]
 
 [artifact.bw-demo]
-# size-profile native binary, host target. Baseline measured 2026-09-22 at
-# 289,800 bytes; budget set with ~3.5% headroom.
-budget_bytes = 300000
-note = "hello-world scaffold; the first Bevy dependency must raise this deliberately with justification"
+# size-profile native binary, host target. Step-up for the first Bevy
+# dependency (ADR 0002): bevy 0.19.1, default-features = false. Measured
+# 1,030,544 bytes; budget set with ~1.9% headroom. Prior scaffold baseline
+# without Bevy was 289,800 bytes.
+budget_bytes = 1050000
+note = "bevy 0.19.1 minimal (app/ecs core only, no renderer) — raises must cite features added"
 
 [deps]
-max_external_normal = 12
-allowed_duplicates = []
+# 12 -> 78 external crates with bevy minimal (ADR 0002). Further raises are
+# one deliberate, justified change at a time.
+max_external_normal = 78
+# Duplicated versions present in bevy 0.19.1's own graph (upstream, not
+# ours): bevy macro crates use syn 2 while serde uses syn 3; bevy_platform
+# pins hashbrown 0.16 while indexmap uses 0.17.
+allowed_duplicates = ["syn", "hashbrown"]
 
 [advisory.build]
 # Compile-time trend threshold; never a hard gate (ADR 0001, D2).

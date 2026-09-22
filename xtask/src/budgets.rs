@@ -191,6 +191,30 @@ pub fn compare(budgets: &Budgets, record: &Record) -> Vec<Finding> {
         }
     }
 
+    if record.wasm.is_empty() {
+        findings.push(Finding::warn(String::from(
+            "wasm: not checked (see record skipped[] for the reason)",
+        )));
+    } else {
+        let failed: Vec<&str> = record
+            .wasm
+            .iter()
+            .filter(|(_, ok)| !**ok)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if failed.is_empty() {
+            findings.push(Finding::ok(format!(
+                "wasm32 check: {} member(s) compile",
+                record.wasm.len()
+            )));
+        } else {
+            findings.push(Finding::breach(format!(
+                "wasm32 check failed for: {}",
+                failed.join(", ")
+            )));
+        }
+    }
+
     findings
 }
 
@@ -271,6 +295,7 @@ mod tests {
                     })
                     .collect(),
             },
+            wasm: BTreeMap::from([("bw-demo".to_string(), true)]),
             skipped: vec![],
         }
     }

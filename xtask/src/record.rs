@@ -18,6 +18,10 @@ pub struct Record {
     /// Artifact name -> size in bytes.
     pub artifacts: BTreeMap<String, u64>,
     pub deps: Deps,
+    /// Scope member -> did `cargo check --target wasm32-unknown-unknown`
+    /// pass. Empty when the check could not run at all (see `skipped`).
+    #[serde(default)]
+    pub wasm: BTreeMap<String, bool>,
     /// Metrics that were not measured, with reasons. Skips are always
     /// recorded, never silent (ADR 0001, D8.7).
     pub skipped: Vec<Skip>,
@@ -99,6 +103,7 @@ mod tests {
                 external_normal: 12,
                 duplicates: BTreeMap::new(),
             },
+            wasm: BTreeMap::from([("bw-demo".to_string(), true)]),
             skipped: vec![Skip {
                 metric: "benches".to_string(),
                 reason: "no benches yet (ADR 0001 Phase 2)".to_string(),

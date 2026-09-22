@@ -54,6 +54,18 @@ pub fn dispatch(args: &[String]) -> Result<u8> {
             )?;
             Ok(report_findings(&loaded, &record, &budgets_path))
         }
+        "attribute" => {
+            let flags = parse_flags(rest, &["--top", "--profile"])?;
+            let top: usize = flags
+                .get("--top")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(15);
+            attribute(
+                top,
+                flags.get("--profile").map(String::as_str).unwrap_or("size"),
+            )?;
+            Ok(0)
+        }
         _ => {
             print_usage();
             Ok(2)
@@ -65,7 +77,8 @@ fn print_usage() {
     eprintln!(
         "usage:\n  \
          cargo xtask perf measure [--profile <name>] [--out <file>] [--runner <name>]\n  \
-         cargo xtask perf check [--budgets <file>] [--profile <name>]"
+         cargo xtask perf check [--budgets <file>] [--profile <name>]\n  \
+         cargo xtask perf attribute [--top <n>] [--profile <name>]"
     );
 }
 
@@ -117,22 +130,27 @@ fn emit(record: &Record, out: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-/// Build the measured members under `profile` and gather every Phase-0
-/// metric. Human-readable progress goes to stderr; data comes back in the
+/// Members whose measurements count: from budgets `[scope]` when present,
+/// else every workspace member except tooling.
+fn scope_members(root: &Path) -> Result<Vec<String>> {
+    let budgets_path = root.join("perf").join("budgets.toml");
+    if budgets_path.exists() {
+        Ok(budgets::load(&budgets_path)?.scope.measured_members)
+    } else {
+        // Seeding mode: measure every member except tooling.
+        Ok(metadata_members(root)?
+            .into_iter()
+            .filter(|name| name != "xtask")
+            .collect())
+    }
+}
+
+/// Build the measured members under `profile` and gather every metric in
+/// scope. Human-readable progress goes to stderr; data comes back in the
 /// returned record.
 fn gather(profile: &str, runner: String) -> Result<Record> {
     let root = workspace_root();
-
-    let budgets_path = root.join("perf").join("budgets.toml");
-    let members = if budgets_path.exists() {
-        budgets::load(&budgets_path)?.scope.measured_members
-    } else {
-        // Seeding mode: measure every member except tooling.
-        metadata_members(&root)?
-            .into_iter()
-            .filter(|name| name != "xtask")
-            .collect::<Vec<_>>()
-    };
+    let members = scope_members(&root)?;
 
     eprintln!("building {} under profile {profile}…", members.join(", "));
     let mut build = vec!["build".to_string(), format!("--profile={profile}")];
@@ -185,6 +203,31 @@ fn gather(profile: &str, runner: String) -> Result<Record> {
         external.len()
     );
 
+    let mut wasm = BTreeMap::new();
+    let mut wasm_skip: Option<String> = None;
+    for member in &members {
+        match run_check_wasm(&root, member) {
+            Ok(passed) => {
+                wasm.insert(member.clone(), passed);
+            }
+            Err(reason) => {
+                // Environment-level failure (e.g. target not installed):
+                // record the skip once, don't pretend members failed.
+                wasm_skip = Some(reason);
+                wasm.clear();
+                break;
+            }
+        }
+    }
+    if wasm.is_empty() {
+        eprintln!(
+            "wasm32 check: skipped ({})",
+            wasm_skip.clone().unwrap_or_default()
+        );
+    } else {
+        eprintln!("wasm32 check: {} member(s) checked", wasm.len());
+    }
+
     Ok(Record {
         schema: 1,
         unix_time: SystemTime::now()
@@ -204,36 +247,137 @@ fn gather(profile: &str, runner: String) -> Result<Record> {
             external_normal: external.len() as u64,
             duplicates,
         },
-        skipped: phase0_skips(),
+        wasm,
+        skipped: build_skips(wasm_skip.as_deref()),
     })
 }
 
-/// Metrics deliberately out of Phase-0 scope, each with its reason so
-/// nothing is silently missing from the record (ADR 0001, D8.7).
-fn phase0_skips() -> Vec<Skip> {
-    vec![
-        Skip {
+/// `cargo check --target wasm32-unknown-unknown -p <member>`: Ok(passed)
+/// distinguishes compile results; Err carries an environment-level reason
+/// (recorded as a skip, not a failure).
+fn run_check_wasm(root: &Path, member: &str) -> Result<bool, String> {
+    let output = std::process::Command::new("cargo")
+        .args(["check", "--target", "wasm32-unknown-unknown", "-p", member])
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("failed to spawn cargo: {e}"))?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("not installed") || stderr.contains("may not be installed") {
+        return Err(String::from(
+            "wasm32-unknown-unknown std target not installed (rustup target add)",
+        ));
+    }
+    Ok(false)
+}
+
+/// Metrics not measured by this run, each with its reason so nothing is
+/// silently missing from the record (ADR 0001, D8.7).
+fn build_skips(wasm_skip: Option<&str>) -> Vec<Skip> {
+    let mut skips = Vec::new();
+    if let Some(reason) = wasm_skip {
+        skips.push(Skip {
             metric: "wasm32 check".to_string(),
-            reason: "no wasm target in scope until the first Bevy dependency (ADR 0001 Phase 1)"
-                .to_string(),
-        },
-        Skip {
-            metric: "benches (iai/criterion)".to_string(),
-            reason: "no benches defined yet (ADR 0001 Phase 2)".to_string(),
-        },
-        Skip {
-            metric: "frame-time/runtime".to_string(),
-            reason: "no headless scenes yet (ADR 0001 Phase 2)".to_string(),
-        },
-        Skip {
-            metric: "memory".to_string(),
-            reason: "no headless scenes yet (ADR 0001 Phase 2)".to_string(),
-        },
-        Skip {
-            metric: "clean compile time".to_string(),
-            reason: "advisory nightly metric (ADR 0001 Phase 3); not measured on PRs".to_string(),
-        },
-    ]
+            reason: reason.to_string(),
+        });
+    }
+    skips.push(Skip {
+        metric: "benches (iai/criterion)".to_string(),
+        reason: "no benches defined yet (ADR 0001 Phase 2)".to_string(),
+    });
+    skips.push(Skip {
+        metric: "frame-time/runtime".to_string(),
+        reason: "no headless scenes yet (ADR 0001 Phase 2)".to_string(),
+    });
+    skips.push(Skip {
+        metric: "memory".to_string(),
+        reason: "no headless scenes yet (ADR 0001 Phase 2)".to_string(),
+    });
+    skips.push(Skip {
+        metric: "clean compile time".to_string(),
+        reason: "advisory nightly metric (ADR 0001 Phase 3); not measured on PRs".to_string(),
+    });
+    skips
+}
+
+/// Attribution report (ADR 0001, D6): size and monomorphization contributors
+/// per member, archived under target/perf/attribution/. Informational only —
+/// regressions arrive with named causes here, but nothing gates on it.
+fn attribute(top: usize, profile: &str) -> Result<()> {
+    let root = workspace_root();
+    let members = scope_members(&root)?;
+    let meta = cargo_metadata(&root)?;
+    let out_dir = root.join("target").join("perf").join("attribution");
+    std::fs::create_dir_all(&out_dir)
+        .with_context(|| format!("failed to create {}", out_dir.display()))?;
+
+    for member in &members {
+        let has_bin = meta.packages.iter().any(|p| {
+            p.name == *member && p.targets.iter().any(|t| t.kind.iter().any(|k| k == "bin"))
+        });
+        if has_bin && tool_available("cargo-bloat") {
+            let log = out_dir.join(format!("{member}.bloat.log"));
+            eprintln!("cargo bloat --crates for {member} (profile {profile})…");
+            match run_capture(
+                &root,
+                "cargo",
+                &[
+                    "bloat",
+                    &format!("--profile={profile}"),
+                    "--crates",
+                    "-n",
+                    &top.to_string(),
+                    &format!("-p{member}"),
+                ],
+            ) {
+                Ok(out) => {
+                    std::fs::write(&log, &out)
+                        .with_context(|| format!("failed to write {}", log.display()))?;
+                    println!("== bloat (crates) [{member}] -> {}", log.display());
+                    println!("{out}");
+                }
+                Err(err) => println!("FAIL  bloat [{member}]: {err:#}"),
+            }
+        } else if has_bin {
+            println!(
+                "SKIP  bloat [{member}]: cargo-bloat not installed (cargo install cargo-bloat)"
+            );
+        }
+
+        if tool_available("cargo-llvm-lines") {
+            let log = out_dir.join(format!("{member}.llvm-lines.log"));
+            eprintln!("cargo llvm-lines for {member}…");
+            match run_capture(
+                &root,
+                "cargo",
+                &["llvm-lines", "--profile", profile, &format!("-p{member}")],
+            ) {
+                Ok(out) => {
+                    std::fs::write(&log, &out)
+                        .with_context(|| format!("failed to write {}", log.display()))?;
+                    println!("== llvm-lines [{member}] -> {} (top {top})", log.display());
+                    for line in out.lines().take(top + 1) {
+                        println!("{line}");
+                    }
+                }
+                Err(err) => println!("FAIL  llvm-lines [{member}]: {err:#}"),
+            }
+        } else {
+            println!(
+                "SKIP  llvm-lines [{member}]: cargo-llvm-lines not installed (cargo install cargo-llvm-lines)"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn tool_available(name: &str) -> bool {
+    let Ok(path_var) = std::env::var("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path_var).any(|dir| dir.join(name).exists())
 }
 
 fn report_findings(loaded: &Budgets, record: &Record, budgets_path: &Path) -> u8 {

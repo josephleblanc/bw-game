@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 bw-core.workspace = true
 anyhow.workspace = true
+bevy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
