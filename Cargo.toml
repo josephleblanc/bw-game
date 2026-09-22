@@ -1,5 +1,7 @@
 [workspace]
-members = ["crates/core","crates/demo"]
+# xtask is a member (so `cargo run -p xtask` and `--workspace` see it) but not
+# a default target; reach it via the `cargo xtask` alias in .cargo/config.toml.
+members = ["crates/core","crates/demo","xtask"]
 default-members = ["crates/demo"]
 resolver = "2"
 
@@ -18,6 +20,7 @@ bw-core = {path = "crates/core"}
 anyhow = "1.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0"
+toml = "1.1" # xtask only (perf budgets); never enters the shipped graph
 
 # Separate objectives, based on the Rust Performance Book. See
 # docs/build-configuration.md for commands, trade-offs, and measurement guidance.
@@ -51,7 +54,9 @@ incremental = true
 debug = false
 panic = "unwind"
 
+[workspace.lints.rust]
+unsafe_code = "deny"
+
 [workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
-unsafe = "deny"

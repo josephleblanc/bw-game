@@ -1,0 +1,4 @@
+# Workspace automation entry point (ADR 0001, D1): all perf tooling lives in
+# the `xtask` crate so CI and developers run identical commands.
+[alias]
+xtask = "run -p xtask --"

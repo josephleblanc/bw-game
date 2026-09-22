@@ -1,0 +1,5 @@
+# Toolchain pin for measurement reproducibility (ADR 0001, D8.2):
+# perf records are only comparable within the same rustc version. This is
+# deliberately exact, while Cargo.toml's `rust-version` remains the MSRV.
+[toolchain]
+channel = "1.95.0"
