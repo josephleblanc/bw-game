@@ -1,0 +1,57 @@
+[workspace]
+members = ["crates/core","crates/demo"]
+default-members = ["crates/demo"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+rust-version = "1.91"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+# Workspace local
+bw-demo = {path = "crates/demo"}
+bw-core = {path = "crates/core"}
+
+# Other dependencies
+anyhow = "1.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0"
+
+# Separate objectives, based on the Rust Performance Book. See
+# docs/build-configuration.md for commands, trade-offs, and measurement guidance.
+# Unwinding is required by rust-analyzer/Salsa cancellation and test observations.
+[profile.runtime]
+inherits = "release"
+opt-level = 3
+codegen-units = 1
+lto = "fat"
+incremental = false
+debug = false
+strip = "none"
+panic = "unwind"
+
+[profile.size]
+inherits = "release"
+opt-level = "z"
+codegen-units = 1
+lto = "fat"
+incremental = false
+debug = false
+strip = "symbols"
+panic = "unwind"
+
+[profile.quick]
+inherits = "dev"
+opt-level = 0
+codegen-units = 256
+lto = "off"
+incremental = true
+debug = false
+panic = "unwind"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+unsafe = "deny"
