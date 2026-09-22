@@ -461,6 +461,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "criterion",
+ "dhat",
  "iai-callgrind",
  "serde",
  "serde_json",

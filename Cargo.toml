@@ -20,6 +20,7 @@ bw-core = {path = "crates/core"}
 anyhow = "1.0"
 bevy = { version = "0.19.1", default-features = false }
 criterion = "0.8" # bench-only (bw-core dev-dep)
+dhat = "0.3" # alloc-pass + heap-usage tests only (dev/optional deps)
 iai-callgrind = "0.16" # bench-only (bw-core dev-dep); needs valgrind
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0"

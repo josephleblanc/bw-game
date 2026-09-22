@@ -16,7 +16,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use bevy::prelude::*;
-use bw_core::sim::{Sim, SpatialHash};
+use bw_core::sim::{Sim, SpatialGrid};
 use bw_core::stats::five_number_summary;
 use serde::Serialize;
 
@@ -86,6 +86,10 @@ fn parse_args() -> Result<Args, String> {
 #[derive(Resource)]
 struct SimState {
     sim: Sim,
+    /// Persistent broadphase storage, rebuilt in place every tick (ADR 0004).
+    grid: SpatialGrid,
+    /// Reused pairs scratch: cleared and refilled by `query_pairs_into`.
+    pairs: Vec<(u32, u32)>,
 }
 
 #[derive(Resource)]
@@ -109,11 +113,12 @@ struct Position {
 fn step_sim(mut state: ResMut<SimState>, cfg: Res<TickConfig>, mut stats: ResMut<Stats>) {
     #[cfg(feature = "perf-alloc")]
     let _probe = alloc::Probe::new("step_sim");
-    state.sim.step(cfg.dt);
-    let hash = SpatialHash::build(&state.sim.xs, &state.sim.ys, QUERY_RADIUS);
-    stats.interactions += hash
-        .query_pairs(&state.sim.xs, &state.sim.ys, QUERY_RADIUS)
-        .len() as u64;
+    let SimState { sim, grid, pairs } = &mut *state;
+    sim.step(cfg.dt);
+    grid.rebuild(&sim.xs, &sim.ys);
+    pairs.clear();
+    grid.query_pairs_into(&sim.xs, &sim.ys, QUERY_RADIUS, pairs);
+    stats.interactions += pairs.len() as u64;
 }
 
 fn sync_positions(state: Res<SimState>, mut query: Query<&mut Position>) {
@@ -252,10 +257,17 @@ fn main() {
     let entities = sim.len();
 
     let mut app = App::new();
-    app.insert_resource(SimState { sim })
-        .insert_resource(TickConfig { dt: 1.0 / 60.0 })
-        .insert_resource(Stats::default())
-        .add_systems(Update, (step_sim, sync_positions).chain());
+    app.insert_resource(SimState {
+        sim,
+        grid: SpatialGrid::new(width, height, QUERY_RADIUS, count),
+        // Sized to the entity count: generous headroom at these densities.
+        // A scene that outgrows it fails the steady-state budget visibly
+        // instead of allocating silently mid-frame (ADR 0004).
+        pairs: Vec::with_capacity(count),
+    })
+    .insert_resource(TickConfig { dt: 1.0 / 60.0 })
+    .insert_resource(Stats::default())
+    .add_systems(Update, (step_sim, sync_positions).chain());
 
     let initial_positions: Vec<(f32, f32)> = {
         let sim = &app.world().resource::<SimState>().sim;
