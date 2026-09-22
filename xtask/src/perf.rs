@@ -1,8 +1,10 @@
 //! `cargo xtask perf` — measurement and budget enforcement (ADR 0001).
 //!
-//! Phase 0 covers artifact sizes and dependency hygiene. Benches, frame
-//! timing, memory, and compile-time trends arrive in later phases and are
-//! recorded as explicit skips until then (D8.7).
+//! Gate tier: artifact sizes, dependency hygiene, wasm32 checks, iai
+//! instruction counts. Trend tier: headless gallery frame times and
+//! allocation counts, criterion wall-clock (run manually). Compile-time
+//! trends are Phase 3; everything out of scope is recorded as an explicit
+//! skip (D8.7).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -12,7 +14,13 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::budgets::{self, Budgets, Level};
-use crate::record::{Config, Deps, Env, Git, Record, Skip};
+use crate::record::{
+    AllocMeasurement, BenchMeasurement, Config, Deps, Env, FrameMeasurement, Git, Record, Skip,
+};
+
+/// Headless-contract defaults (ADR 0001, D4; ADR 0003).
+const PERF_TICKS: &str = "600";
+const PERF_SEED: &str = "42";
 
 pub fn dispatch(args: &[String]) -> Result<u8> {
     let Some((sub, rest)) = args.split_first() else {
@@ -228,6 +236,168 @@ fn gather(profile: &str, runner: String) -> Result<Record> {
         eprintln!("wasm32 check: {} member(s) checked", wasm.len());
     }
 
+    // iai-callgrind benches (gate tier): instruction counts.
+    let mut benches = BTreeMap::new();
+    let mut bench_skip: Option<String> = None;
+    let iai_targets: Vec<(String, String)> = meta
+        .packages
+        .iter()
+        .filter(|p| members.contains(&p.name))
+        .flat_map(|p| {
+            p.targets
+                .iter()
+                .filter(|t| t.kind.iter().any(|k| k == "bench") && t.name.starts_with("iai"))
+                .map(move |t| (p.name.clone(), t.name.clone()))
+        })
+        .collect();
+    if iai_targets.is_empty() {
+        bench_skip = Some(String::from("no iai bench targets defined"));
+    }
+    for (member, bench_name) in &iai_targets {
+        eprintln!("iai bench {bench_name} ({member}) under valgrind…");
+        match run_capture(
+            &root,
+            "cargo",
+            &[
+                "bench",
+                "--profile",
+                "runtime",
+                "-p",
+                member,
+                "--bench",
+                bench_name,
+            ],
+        ) {
+            Ok(out) => {
+                for (id, count) in parse_iai(&out) {
+                    benches.insert(
+                        id,
+                        BenchMeasurement {
+                            instructions: count,
+                        },
+                    );
+                }
+            }
+            Err(err) => {
+                bench_skip = Some(format!(
+                    "iai bench run failed (is valgrind installed?): {err:#}"
+                ));
+                break;
+            }
+        }
+    }
+    eprintln!("benches: {} iai bench(es) measured", benches.len());
+
+    // Headless gallery passes (trend tier): timing pass on the default
+    // build, allocation pass on the perf-alloc build (ADR 0003, D8.8).
+    let mut runtime = BTreeMap::new();
+    let mut memory = BTreeMap::new();
+    let mut runtime_skip: Option<String> = Some(String::from(
+        "no gallery binaries with a headless contract found",
+    ));
+    let mut memory_skip: Option<String> = Some(String::from("no gallery binaries discovered"));
+    let bins = member_bins(&meta, &members);
+    for (member, bin) in &bins {
+        run_capture(
+            &root,
+            "cargo",
+            &["build", "--profile", "runtime", "-p", member],
+        )?;
+        let bin_path = meta.target_directory.join("runtime").join(bin);
+        let Some(bin_str) = bin_path.to_str() else {
+            continue;
+        };
+        let Ok(scenes) = run_capture(&root, bin_str, &["--perf-scenes"]) else {
+            continue; // not a gallery binary
+        };
+        let scenes: Vec<&str> = scenes.split_whitespace().collect();
+        if scenes.is_empty() {
+            continue;
+        }
+        runtime_skip = None;
+        for scene in &scenes {
+            let out = run_capture(
+                &root,
+                bin_str,
+                &[
+                    "--perf-headless",
+                    "--scene",
+                    scene,
+                    "--ticks",
+                    PERF_TICKS,
+                    "--seed",
+                    PERF_SEED,
+                    "--json",
+                ],
+            )?;
+            if let Some(measured) = parse_perf_json(&out).and_then(|v| frame_measurement(&v)) {
+                runtime.insert(format!("{member}::{scene}"), measured);
+            }
+        }
+        eprintln!("runtime: {} scene(s) timed", runtime.len());
+
+        // Allocation pass: separate build with the perf-alloc feature so
+        // the counting allocator never perturbs the timing numbers above.
+        match run_capture(
+            &root,
+            "cargo",
+            &[
+                "build",
+                "--profile",
+                "runtime",
+                "-p",
+                member,
+                "--features",
+                "perf-alloc",
+            ],
+        ) {
+            Ok(_) => {
+                memory_skip = None;
+                for scene in &scenes {
+                    let out = run_capture(
+                        &root,
+                        bin_str,
+                        &[
+                            "--perf-headless",
+                            "--scene",
+                            scene,
+                            "--ticks",
+                            PERF_TICKS,
+                            "--seed",
+                            PERF_SEED,
+                            "--perf-alloc",
+                            "--json",
+                        ],
+                    )?;
+                    if let Some(measured) =
+                        parse_perf_json(&out).and_then(|v| alloc_measurement(&v))
+                    {
+                        memory.insert(format!("{member}::{scene}"), measured);
+                    }
+                }
+                eprintln!("memory: {} scene(s) counted", memory.len());
+            }
+            Err(err) => {
+                memory_skip = Some(format!("perf-alloc build failed: {err:#}"));
+            }
+        }
+    }
+
+    if runtime.is_empty() && runtime_skip.is_none() {
+        runtime_skip = Some(String::from(
+            "gallery scenes ran but no timing reports parsed",
+        ));
+    }
+    if memory.is_empty() && memory_skip.is_none() {
+        memory_skip = Some(String::from("gallery alloc pass ran but no reports parsed"));
+    }
+    let skipped = build_skips(
+        wasm_skip.as_deref(),
+        bench_skip.as_deref().filter(|_| benches.is_empty()),
+        runtime_skip.as_deref().filter(|_| runtime.is_empty()),
+        memory_skip.as_deref().filter(|_| memory.is_empty()),
+    );
+
     Ok(Record {
         schema: 1,
         unix_time: SystemTime::now()
@@ -248,7 +418,10 @@ fn gather(profile: &str, runner: String) -> Result<Record> {
             duplicates,
         },
         wasm,
-        skipped: build_skips(wasm_skip.as_deref()),
+        benches,
+        runtime,
+        memory,
+        skipped,
     })
 }
 
@@ -275,26 +448,37 @@ fn run_check_wasm(root: &Path, member: &str) -> Result<bool, String> {
 
 /// Metrics not measured by this run, each with its reason so nothing is
 /// silently missing from the record (ADR 0001, D8.7).
-fn build_skips(wasm_skip: Option<&str>) -> Vec<Skip> {
+fn build_skips(
+    wasm: Option<&str>,
+    benches: Option<&str>,
+    runtime: Option<&str>,
+    memory: Option<&str>,
+) -> Vec<Skip> {
     let mut skips = Vec::new();
-    if let Some(reason) = wasm_skip {
+    if let Some(reason) = wasm {
         skips.push(Skip {
             metric: "wasm32 check".to_string(),
             reason: reason.to_string(),
         });
     }
-    skips.push(Skip {
-        metric: "benches (iai/criterion)".to_string(),
-        reason: "no benches defined yet (ADR 0001 Phase 2)".to_string(),
-    });
-    skips.push(Skip {
-        metric: "frame-time/runtime".to_string(),
-        reason: "no headless scenes yet (ADR 0001 Phase 2)".to_string(),
-    });
-    skips.push(Skip {
-        metric: "memory".to_string(),
-        reason: "no headless scenes yet (ADR 0001 Phase 2)".to_string(),
-    });
+    if let Some(reason) = benches {
+        skips.push(Skip {
+            metric: "benches (iai/criterion)".to_string(),
+            reason: reason.to_string(),
+        });
+    }
+    if let Some(reason) = runtime {
+        skips.push(Skip {
+            metric: "frame-time/runtime".to_string(),
+            reason: reason.to_string(),
+        });
+    }
+    if let Some(reason) = memory {
+        skips.push(Skip {
+            metric: "memory".to_string(),
+            reason: reason.to_string(),
+        });
+    }
     skips.push(Skip {
         metric: "clean compile time".to_string(),
         reason: "advisory nightly metric (ADR 0001 Phase 3); not measured on PRs".to_string(),
@@ -479,6 +663,78 @@ fn parse_tree_packages(tree: &str) -> BTreeSet<(String, String)> {
         .collect()
 }
 
+/// Parse iai-callgrind output: a non-indented bench id line followed by
+/// indented stat lines; we keep the "Instructions:" count per bench.
+fn parse_iai(out: &str) -> BTreeMap<String, u64> {
+    let mut map = BTreeMap::new();
+    let mut current: Option<String> = None;
+    for line in out.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !line.starts_with(' ') {
+            current = Some(trimmed.to_string());
+        } else if let Some(id) = &current
+            && let Some(rest) = trimmed.strip_prefix("Instructions:")
+        {
+            // Comparison runs print "current|baseline (pct) [factor]":
+            // keep only the current value (left of the pipe).
+            let value_part = rest.split('|').next().unwrap_or(rest);
+            let digits: String = value_part.chars().filter(|c| c.is_ascii_digit()).collect();
+            if let Ok(count) = digits.parse() {
+                map.insert(id.clone(), count);
+            }
+        }
+    }
+    map
+}
+
+/// Gallery binaries report JSON on stdout, possibly after other output;
+/// parse from the first '{'.
+fn parse_perf_json(out: &str) -> Option<serde_json::Value> {
+    let start = out.find('{')?;
+    serde_json::from_str(&out[start..]).ok()
+}
+
+fn frame_measurement(v: &serde_json::Value) -> Option<FrameMeasurement> {
+    let f = v.get("frame_ms")?;
+    Some(FrameMeasurement {
+        frame_ms_min: f.get("min")?.as_f64()?,
+        frame_ms_p50: f.get("p50")?.as_f64()?,
+        frame_ms_p90: f.get("p90")?.as_f64()?,
+        frame_ms_p99: f.get("p99")?.as_f64()?,
+        frame_ms_max: f.get("max")?.as_f64()?,
+        entities: v.get("entities")?.as_u64()?,
+        ticks: v.get("ticks")?.as_u64()?,
+        interactions: v.get("interactions")?.as_u64()?,
+    })
+}
+
+fn alloc_measurement(v: &serde_json::Value) -> Option<AllocMeasurement> {
+    let a = v.get("allocs")?;
+    Some(AllocMeasurement {
+        allocs: a.get("count")?.as_u64()?,
+        peak_bytes: a.get("peak_bytes")?.as_u64()?,
+    })
+}
+
+/// (member, bin-name) for every scope member with a binary target.
+fn member_bins(meta: &Metadata, members: &[String]) -> Vec<(String, String)> {
+    let mut bins = Vec::new();
+    for package in &meta.packages {
+        if !members.contains(&package.name) {
+            continue;
+        }
+        for target in &package.targets {
+            if target.kind.iter().any(|k| k == "bin") {
+                bins.push((package.name.clone(), target.name.clone()));
+            }
+        }
+    }
+    bins
+}
+
 // ---- environment ----------------------------------------------------------
 
 fn run_capture(root: &Path, program: &str, args: &[&str]) -> Result<String> {
@@ -580,6 +836,33 @@ serde v1.0.200
         assert!(pairs.contains(&("serde".to_string(), "1.0.200".to_string())));
         assert!(pairs.contains(&("serde_derive".to_string(), "1.0.229".to_string())));
         assert!(pairs.contains(&("bw-demo".to_string(), "0.1.0".to_string())));
+    }
+
+    #[test]
+    fn iai_parser_extracts_instruction_counts() {
+        let out = "iai_sim::sim::step step_1000:setup_sim_1000()
+  Instructions:                      13005|13005                (No change)
+  L1 Hits:                           15282|15282                (No change)
+iai_sim::sim::hash_build build_1000:setup_sim_1000()
+  Instructions:                     646330|646409               (-0.01222%) [-1.00012x]
+iai_sim::sim::hash_query query_1000:setup_hash_1000()
+  Instructions:                     1491128|1490286              (+0.05650%) [+1.00056x]
+Iai-Callgrind result: Ok. 3 without regressions
+";
+        let map = parse_iai(out);
+        assert_eq!(map.len(), 3);
+        assert_eq!(
+            map.get("iai_sim::sim::step step_1000:setup_sim_1000()"),
+            Some(&13_005)
+        );
+        assert_eq!(
+            map.get("iai_sim::sim::hash_build build_1000:setup_sim_1000()"),
+            Some(&646_330)
+        );
+        assert_eq!(
+            map.get("iai_sim::sim::hash_query query_1000:setup_hash_1000()"),
+            Some(&1_491_128)
+        );
     }
 
     #[test]

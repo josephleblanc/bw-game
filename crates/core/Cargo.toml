@@ -12,3 +12,16 @@ serde_json.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# Bench-only: never enters the shipped dependency graph (ADR 0001 Phase 2).
+criterion.workspace = true
+iai-callgrind.workspace = true
+
+[[bench]]
+name = "sim"
+harness = false
+
+[[bench]]
+name = "iai_sim"
+harness = false

@@ -1,14 +1,8 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! bw-core: engine-agnostic game logic.
+//!
+//! Simulation and domain code lives here in plain Rust (ADR 0002) so it is
+//! benchmarkable without the engine and insulated from engine churn; Bevy
+//! glue lives in the gallery binaries.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub mod sim;
+pub mod stats;

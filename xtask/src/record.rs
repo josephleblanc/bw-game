@@ -22,6 +22,16 @@ pub struct Record {
     /// pass. Empty when the check could not run at all (see `skipped`).
     #[serde(default)]
     pub wasm: BTreeMap<String, bool>,
+    /// iai-callgrind bench id -> instruction count (gate tier, ADR 0001 D2).
+    #[serde(default)]
+    pub benches: BTreeMap<String, BenchMeasurement>,
+    /// Headless gallery scene -> frame-time stats (trend tier). Timing pass
+    /// only; never measured with the counting allocator active (D8.8).
+    #[serde(default)]
+    pub runtime: BTreeMap<String, FrameMeasurement>,
+    /// Headless gallery scene -> allocation stats from the perf-alloc pass.
+    #[serde(default)]
+    pub memory: BTreeMap<String, AllocMeasurement>,
     /// Metrics that were not measured, with reasons. Skips are always
     /// recorded, never silent (ADR 0001, D8.7).
     pub skipped: Vec<Skip>,
@@ -71,6 +81,30 @@ pub struct Skip {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BenchMeasurement {
+    /// Total instructions reported by iai-callgrind.
+    pub instructions: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FrameMeasurement {
+    pub frame_ms_min: f64,
+    pub frame_ms_p50: f64,
+    pub frame_ms_p90: f64,
+    pub frame_ms_p99: f64,
+    pub frame_ms_max: f64,
+    pub entities: u64,
+    pub ticks: u64,
+    pub interactions: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AllocMeasurement {
+    pub allocs: u64,
+    pub peak_bytes: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +138,32 @@ mod tests {
                 duplicates: BTreeMap::new(),
             },
             wasm: BTreeMap::from([("bw-demo".to_string(), true)]),
+            benches: BTreeMap::from([(
+                "iai_sim::sim::step step_1000".to_string(),
+                BenchMeasurement {
+                    instructions: 41_233,
+                },
+            )]),
+            runtime: BTreeMap::from([(
+                "bw-demo::bounce".to_string(),
+                FrameMeasurement {
+                    frame_ms_min: 0.1,
+                    frame_ms_p50: 0.2,
+                    frame_ms_p90: 0.3,
+                    frame_ms_p99: 0.4,
+                    frame_ms_max: 0.5,
+                    entities: 1_000,
+                    ticks: 600,
+                    interactions: 30_000,
+                },
+            )]),
+            memory: BTreeMap::from([(
+                "bw-demo::bounce".to_string(),
+                AllocMeasurement {
+                    allocs: 259_981,
+                    peak_bytes: 316_999,
+                },
+            )]),
             skipped: vec![Skip {
                 metric: "benches".to_string(),
                 reason: "no benches yet (ADR 0001 Phase 2)".to_string(),

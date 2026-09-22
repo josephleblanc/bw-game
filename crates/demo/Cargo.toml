@@ -12,5 +12,10 @@ bevy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+[features]
+# Allocation-counting pass build (ADR 0003): separate build/run so the
+# counting allocator never perturbs timing measurements.
+perf-alloc = []
+
 [lints]
 workspace = true

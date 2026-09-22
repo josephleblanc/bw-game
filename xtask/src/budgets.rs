@@ -18,8 +18,17 @@ pub struct Budgets {
     pub scope: Scope,
     pub artifact: BTreeMap<String, ArtifactBudget>,
     pub deps: Deps,
+    /// iai-callgrind bench id -> instruction-count ceiling.
+    #[serde(default)]
+    pub bench: BTreeMap<String, BenchBudget>,
     #[serde(default)]
     pub advisory: Advisory,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BenchBudget {
+    pub max_instructions: u64,
+    pub note: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -215,6 +224,52 @@ pub fn compare(budgets: &Budgets, record: &Record) -> Vec<Finding> {
         }
     }
 
+    for (id, budget) in &budgets.bench {
+        match record.benches.get(id) {
+            Some(measured) => {
+                if measured.instructions > budget.max_instructions {
+                    findings.push(Finding::breach(format!(
+                        "bench {id}: {} instructions > budget {} — note: {}",
+                        fmt_num(measured.instructions),
+                        fmt_num(budget.max_instructions),
+                        budget.note,
+                    )));
+                } else {
+                    findings.push(Finding::ok(format!(
+                        "bench {id}: {} / {} instructions",
+                        fmt_num(measured.instructions),
+                        fmt_num(budget.max_instructions),
+                    )));
+                }
+            }
+            None => findings.push(Finding::warn(format!(
+                "bench {id}: budgeted but not measured (did the bench run?)"
+            ))),
+        }
+    }
+    for id in record.benches.keys() {
+        if !budgets.bench.contains_key(id) {
+            findings.push(Finding::warn(format!(
+                "bench {id}: measured but unbudgeted — add it to perf/budgets.toml"
+            )));
+        }
+    }
+
+    // Trend-tier metrics: recorded and surfaced, never gated (ADR 0001 D2).
+    for (scene, frame) in &record.runtime {
+        findings.push(Finding::ok(format!(
+            "trend runtime {scene}: p50 {:.3} ms, p99 {:.3} ms over {} ticks of {} entities",
+            frame.frame_ms_p50, frame.frame_ms_p99, frame.ticks, frame.entities,
+        )));
+    }
+    for (scene, mem) in &record.memory {
+        findings.push(Finding::ok(format!(
+            "trend memory {scene}: {} allocs, peak {} bytes",
+            fmt_num(mem.allocs),
+            fmt_num(mem.peak_bytes),
+        )));
+    }
+
     findings
 }
 
@@ -255,6 +310,7 @@ mod tests {
                 max_external_normal: max_deps,
                 allowed_duplicates: vec!["old-dup".to_string()],
             },
+            bench: BTreeMap::new(),
             advisory: Advisory::default(),
         }
     }
@@ -296,6 +352,9 @@ mod tests {
                     .collect(),
             },
             wasm: BTreeMap::from([("bw-demo".to_string(), true)]),
+            benches: BTreeMap::new(),
+            runtime: BTreeMap::new(),
+            memory: BTreeMap::new(),
             skipped: vec![],
         }
     }
@@ -372,5 +431,49 @@ mod tests {
         assert_eq!(fmt_num(999), "999");
         assert_eq!(fmt_num(390_104), "390,104");
         assert_eq!(fmt_num(1_000_000), "1,000,000");
+    }
+
+    #[test]
+    fn compare_gates_on_instruction_budgets() {
+        let mut budgets = fixture(100, 10);
+        budgets.bench.insert(
+            "sim::step".to_string(),
+            BenchBudget {
+                max_instructions: 1_000,
+                note: "test".to_string(),
+            },
+        );
+        let mut within = record_fixture(100, 10, &[]);
+        within.benches.insert(
+            "sim::step".to_string(),
+            rec::BenchMeasurement { instructions: 999 },
+        );
+        let findings = compare(&budgets, &within);
+        assert_eq!(
+            findings.iter().filter(|f| f.level == Level::Breach).count(),
+            0
+        );
+        assert!(findings.iter().any(|f| f.text.contains("999 / 1,000")));
+
+        let mut over = record_fixture(100, 10, &[]);
+        over.benches.insert(
+            "sim::step".to_string(),
+            rec::BenchMeasurement {
+                instructions: 1_001,
+            },
+        );
+        let findings = compare(&budgets, &over);
+        assert!(
+            findings.iter().any(|f| f.level == Level::Breach
+                && f.text.contains("1,001 instructions > budget 1,000"))
+        );
+
+        // Budgeted but missing from the record: warn, not silent.
+        let findings = compare(&budgets, &record_fixture(100, 10, &[]));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.level == Level::Warn && f.text.contains("budgeted but not measured"))
+        );
     }
 }
