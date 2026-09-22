@@ -74,3 +74,4 @@ Phasing, pointers to the code that realizes the decision.
 | 0001   | [Mandatory performance tracking for time and space](0001-mandatory-performance-tracking.md) | Accepted |
 | 0002   | [Adopt Bevy with a contained feature footprint](0002-adopt-bevy-minimal-footprint.md) | Accepted |
 | 0003   | [Headless gallery harness and benchmark contracts](0003-headless-gallery-harness.md) | Accepted |
+| 0004   | [Allocation policy — allocate once, steady-state zero](0004-allocation-policy.md) | Accepted |

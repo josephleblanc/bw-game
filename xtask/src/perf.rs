@@ -713,9 +713,18 @@ fn frame_measurement(v: &serde_json::Value) -> Option<FrameMeasurement> {
 
 fn alloc_measurement(v: &serde_json::Value) -> Option<AllocMeasurement> {
     let a = v.get("allocs")?;
+    let steady = v
+        .pointer("/alloc_detail/measured/blocks_per_tick")
+        .and_then(|b| {
+            Some(crate::record::SteadyTicks {
+                p50: b.get("p50")?.as_f64()?,
+                max: b.get("max")?.as_f64()?,
+            })
+        });
     Some(AllocMeasurement {
         allocs: a.get("count")?.as_u64()?,
         peak_bytes: a.get("peak_bytes")?.as_u64()?,
+        steady_blocks_per_tick: steady,
     })
 }
 

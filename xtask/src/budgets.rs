@@ -21,6 +21,10 @@ pub struct Budgets {
     /// iai-callgrind bench id -> instruction-count ceiling.
     #[serde(default)]
     pub bench: BTreeMap<String, BenchBudget>,
+    /// Per-scene steady-state allocation ceilings (ADR 0004): blocks per
+    /// tick in the measured window, gated on the worse of p50/max.
+    #[serde(default)]
+    pub steady: BTreeMap<String, SteadyBudget>,
     #[serde(default)]
     pub advisory: Advisory,
 }
@@ -28,6 +32,12 @@ pub struct Budgets {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchBudget {
     pub max_instructions: u64,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SteadyBudget {
+    pub max_blocks_per_tick: u64,
     pub note: String,
 }
 
@@ -255,6 +265,41 @@ pub fn compare(budgets: &Budgets, record: &Record) -> Vec<Finding> {
         }
     }
 
+    // Steady-state allocation gate (ADR 0004): the worse of p50/max in the
+    // measured window must sit under the budget.
+    for (scene, budget) in &budgets.steady {
+        match record
+            .memory
+            .get(scene)
+            .and_then(|m| m.steady_blocks_per_tick.as_ref())
+        {
+            Some(steady) => {
+                let worst = steady.p50.max(steady.max);
+                if worst > budget.max_blocks_per_tick as f64 {
+                    findings.push(Finding::breach(format!(
+                        "steady {scene}: {worst:.1} blocks/tick (p50 {:.1}, max {:.1}) > budget {} — note: {}",
+                        steady.p50, steady.max, budget.max_blocks_per_tick, budget.note,
+                    )));
+                } else {
+                    findings.push(Finding::ok(format!(
+                        "steady {scene}: p50 {:.1} / max {:.1} blocks/tick <= {}",
+                        steady.p50, steady.max, budget.max_blocks_per_tick,
+                    )));
+                }
+            }
+            None => findings.push(Finding::warn(format!(
+                "steady {scene}: budgeted but no steady-state data (did the alloc pass run?)"
+            ))),
+        }
+    }
+    for (scene, measured) in &record.memory {
+        if measured.steady_blocks_per_tick.is_some() && !budgets.steady.contains_key(scene) {
+            findings.push(Finding::warn(format!(
+                "steady {scene}: measured but unbudgeted — add [steady.{scene}] to perf/budgets.toml"
+            )));
+        }
+    }
+
     // Trend-tier metrics: recorded and surfaced, never gated (ADR 0001 D2).
     for (scene, frame) in &record.runtime {
         findings.push(Finding::ok(format!(
@@ -311,6 +356,7 @@ mod tests {
                 allowed_duplicates: vec!["old-dup".to_string()],
             },
             bench: BTreeMap::new(),
+            steady: BTreeMap::new(),
             advisory: Advisory::default(),
         }
     }
@@ -422,6 +468,59 @@ mod tests {
             findings
                 .iter()
                 .any(|f| f.level == Level::Breach && f.text.contains("serde (1.0.200, 1.0.210)"))
+        );
+    }
+
+    #[test]
+    fn compare_gates_steady_state_allocations() {
+        let mut budgets = fixture(100, 10);
+        budgets.steady.insert(
+            "bw-demo::bounce".to_string(),
+            SteadyBudget {
+                max_blocks_per_tick: 0,
+                note: "zero-alloc rule".to_string(),
+            },
+        );
+        let mut clean = record_fixture(100, 10, &[]);
+        clean.memory.insert(
+            "bw-demo::bounce".to_string(),
+            rec::AllocMeasurement {
+                allocs: 1000,
+                peak_bytes: 1000,
+                steady_blocks_per_tick: Some(rec::SteadyTicks { p50: 0.0, max: 0.0 }),
+            },
+        );
+        let findings = compare(&budgets, &clean);
+        assert_eq!(
+            findings.iter().filter(|f| f.level == Level::Breach).count(),
+            0
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.text.contains("steady bw-demo::bounce: p50 0.0 / max 0.0"))
+        );
+
+        let mut dirty = record_fixture(100, 10, &[]);
+        dirty.memory.insert(
+            "bw-demo::bounce".to_string(),
+            rec::AllocMeasurement {
+                allocs: 1000,
+                peak_bytes: 1000,
+                steady_blocks_per_tick: Some(rec::SteadyTicks { p50: 0.0, max: 1.0 }),
+            },
+        );
+        let findings = compare(&budgets, &dirty);
+        assert!(findings.iter().any(|f| f.level == Level::Breach
+            && f.text.contains("steady bw-demo::bounce")
+            && f.text.contains("> budget 0")));
+
+        // Budgeted but no steady data: warn, not silent.
+        let findings = compare(&budgets, &record_fixture(100, 10, &[]));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.level == Level::Warn && f.text.contains("no steady-state data"))
         );
     }
 

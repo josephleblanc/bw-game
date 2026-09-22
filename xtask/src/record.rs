@@ -103,6 +103,16 @@ pub struct FrameMeasurement {
 pub struct AllocMeasurement {
     pub allocs: u64,
     pub peak_bytes: u64,
+    /// Steady-state blocks/tick from the measured window, when the alloc
+    /// pass produced the detail (ADR 0004 gate data).
+    #[serde(default)]
+    pub steady_blocks_per_tick: Option<SteadyTicks>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SteadyTicks {
+    pub p50: f64,
+    pub max: f64,
 }
 
 #[cfg(test)]
@@ -162,6 +172,7 @@ mod tests {
                 AllocMeasurement {
                     allocs: 259_981,
                     peak_bytes: 316_999,
+                    steady_blocks_per_tick: Some(SteadyTicks { p50: 0.0, max: 0.0 }),
                 },
             )]),
             skipped: vec![Skip {
