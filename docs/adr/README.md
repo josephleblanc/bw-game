@@ -75,3 +75,4 @@ Phasing, pointers to the code that realizes the decision.
 | 0002   | [Adopt Bevy with a contained feature footprint](0002-adopt-bevy-minimal-footprint.md) | Accepted |
 | 0003   | [Headless gallery harness and benchmark contracts](0003-headless-gallery-harness.md) | Accepted |
 | 0004   | [Allocation policy — allocate once, steady-state zero](0004-allocation-policy.md) | Accepted |
+| 0005   | [Storage-class policy — the stack is the default](0005-storage-policy-stack-by-default.md) | Accepted |
