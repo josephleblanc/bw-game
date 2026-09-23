@@ -167,6 +167,40 @@ nested rings carrying round-robin (chest holds, side holds,
 empty-handed), the loaded walks shortening their strides —
 `--scene carry` works in the headless harness and the SVG render too.
 
+## Map scenes (the live map viewer)
+
+`--scene map` (and `--scene map-archipelago`) are the map roadmap's
+viewer tier: the playground opens on **generated terrain** —
+`bw_core::map` tiles painted as a soil checkerboard with stone
+outcrops and sunk, translucent ponds — with the player figure and a
+handful of wanderers standing on walkable tiles (viewer-only;
+headless map output is bw-map-gallery's).
+
+- **Click-to-send routes through A***: the ground click converts to a
+  tile, one pathfinding query runs in `Update`, and the figure walks
+  the tile route (`FollowPath`). Faint red dots mark the remaining
+  waypoints and expire as the figure passes them; the red disc marks
+  the destination and clears on arrival. Clicking water refuses —
+  no route, no marker.
+- **Wanderers** re-route themselves to nearby walkable tiles every
+  few seconds (routes bend around ponds; the player is never
+  auto-sent).
+- **Pan** — the one new camera capability a map needs: right-drag
+  translates the free focus along the ground (the world rides the
+  cursor; the ADR 0006 orientation and zoom law are unchanged — the
+  map camera just stops following the selection, colony-sim style).
+
+Map smoke:
+
+```sh
+cargo run -p bw-walker-gallery --features viewer -- \
+  --viewer --scene map --seed 42 --viewer-shot /tmp/mapview.png
+# writes /tmp/mapview-{meadow,route,arrived,pan}.png
+# (terrain with wanderers ~1.3s, mid-walk of a scripted routed send
+# with dots down ~3.0s, arrival ~6.0s, a scripted pan ~7.0s),
+# exits at t=7.6s
+```
+
 Smoke test without touching the keyboard:
 
 ```sh

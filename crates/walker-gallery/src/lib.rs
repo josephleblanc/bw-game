@@ -163,6 +163,17 @@ impl FollowPath {
     pub fn new(tiles: Vec<Tile>) -> Self {
         Self { tiles, next: 0 }
     }
+
+    /// Waypoint index being walked (markers read it to expire dots the
+    /// figure has passed).
+    pub fn progress(&self) -> usize {
+        self.next
+    }
+
+    /// Whether the route is spent — the controller now holds inert.
+    pub fn is_finished(&self) -> bool {
+        self.next >= self.tiles.len()
+    }
 }
 
 /// Waypoint arrival radius (m) — [`MoveTarget`]'s read.

@@ -57,12 +57,15 @@ use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::window::{PrimaryWindow, WindowResolution};
 
 use bw_core::character::{Carry, Character, MovementInput, Skeleton, bone};
+use bw_core::map::{Map, Tile, tile_center, tile_of};
 use bw_core::math::Vec3 as BwVec3;
+use bw_core::path::Pathfinder;
+use bw_core::sim::Rng;
 use bw_core::time::SIM_DT;
 
 use bw_walker_gallery::{
-    BoneSegment, CharacterMovementPlugin, CirclePath, MoveTarget, MovementAlpha, MovementPause,
-    Walker, WalkerSkeleton, spawn_walker,
+    BoneSegment, CharacterMovementPlugin, CirclePath, FollowPath, MoveTarget, MovementAlpha,
+    MovementPause, Walker, WalkerSkeleton, spawn_walker,
 };
 
 use crate::svg::{EYE, FOV_Y_DEG, TARGET};
@@ -79,7 +82,7 @@ const TILES: i32 = 24;
 /// ADR 0006 orientation (the same constants the map gallery's SVG
 /// projection reads, so the surfaces can't drift).
 fn follow_dir() -> Vec3 {
-    bw_core::camera::tactical_dir()
+    to_bevy(bw_core::camera::tactical_dir())
 }
 /// Follow distance at zoom 1 (m). Meaningful to the perspective
 /// projection; the default orthographic camera frames by view height
@@ -103,6 +106,17 @@ const SKY: Color = Color::srgb(0.78, 0.89, 0.96);
 /// Selection ring and goal-marker inks.
 const SELECT_INK: Color = Color::srgba(0.95, 0.72, 0.20, 0.55);
 const GOAL_INK: Color = Color::srgba(0.90, 0.25, 0.15, 0.75);
+/// Map-scene terrain inks: the soil checkerboard reuses the meadow
+/// greens; stone and water are their own reads (water runs slightly
+/// transparent and a hair sunk).
+const MAP_STONE: Color = Color::srgb(0.60, 0.57, 0.50);
+const MAP_WATER: Color = Color::srgba(0.23, 0.42, 0.60, 0.88);
+/// Route dots: the same goal red, fainter — waypoints vanish as the
+/// figure passes them.
+const ROUTE_INK: Color = Color::srgba(0.90, 0.25, 0.15, 0.45);
+/// Ambient map wanderers re-target every so often (sim-side feel of a
+/// lived-in colony; the player figure is never auto-sent).
+const MAP_RESEND_EVERY: f32 = 5.0;
 /// Selection sphere radius and goal-arrival radius (m at scale 1).
 const PICK_RADIUS: f32 = 0.85;
 const ARRIVE_RADIUS: f32 = 0.30;
@@ -217,15 +231,42 @@ struct Viewer {
     edit_count: u32,
     /// Shared marker geometry/materials (spawn-once handles).
     kit: MarkerKit,
+    /// Map scenes (tier 4): the generated world and its free camera.
+    /// `None` for circle scenes — everything map-flavored branches on
+    /// this.
+    map: Option<MapScene>,
+    /// The player figure's home — `R` returns here ((0, 0, 3) for
+    /// circle scenes, the spawn tile center for map scenes).
+    home: BwVec3,
+    /// Last frame's cursor position while right-drag pans the map
+    /// camera.
+    pan_last: Option<Vec2>,
 }
 
-/// Marker assets created once at startup: the selection ring and the
-/// goal disc (flat unlit circles at the ground).
+/// The map viewer's world: the generated map, its reusable pathfinder
+/// (one A* scratchpad, reused per send — the query is event-driven,
+/// never per tick), the send scratch, the free camera's focus, and
+/// the ambient wanderers' rng.
+struct MapScene {
+    map: Map,
+    pathfinder: Pathfinder,
+    scratch: Vec<Tile>,
+    /// The free camera's focus (map mode does not follow the
+    /// selection — pan owns the frame, colony-sim style).
+    focus: BwVec3,
+    rng: Rng,
+    resend: f32,
+}
+
+/// Marker assets created once at startup: the selection ring, the
+/// goal disc, and the route dots (flat unlit circles at the ground).
 struct MarkerKit {
     ring_mesh: Handle<Mesh>,
     ring_mat: Handle<StandardMaterial>,
     goal_mesh: Handle<Mesh>,
     goal_mat: Handle<StandardMaterial>,
+    dot_mesh: Handle<Mesh>,
+    dot_mat: Handle<StandardMaterial>,
 }
 
 #[derive(Resource, Default)]
@@ -260,10 +301,20 @@ struct SelectionRing {
 }
 
 /// A click-to-move goal disc; lives until its walker's [`MoveTarget`]
-/// is replaced, cancelled, or arrived.
+/// is replaced, cancelled, or arrived — or, on map scenes, until its
+/// [`FollowPath`] route is spent.
 #[derive(Component)]
 struct GoalMarker {
     walker: Entity,
+}
+
+/// One waypoint dot of a routed send: despawns when its figure passes
+/// the waypoint (route progress exceeds its index) or the route goes
+/// away.
+#[derive(Component)]
+struct RouteDot {
+    walker: Entity,
+    index: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -342,22 +393,83 @@ pub fn run(scene_id: &str, seed: u64, shot: Option<&str>) {
     let viewer = {
         let world = app.world_mut();
         let skeleton = world.resource::<WalkerSkeleton>().0.clone();
+        // Map scenes: generate the world first — the figures stand on
+        // its walkable tiles (and sends route through its pathfinder).
+        let map_scene = preset.map.as_ref().map(|params| {
+            let map = Map::generate(seed, *params);
+            let walkable: Vec<Tile> = (0..map.height() as i32)
+                .flat_map(|z| (0..map.width() as i32).map(move |x| Tile { x, z }))
+                .filter(|&t| map.walkable(t))
+                .collect();
+            // The player takes the walkable tile nearest the center;
+            // the wanderers spread through the rest.
+            let (w, h) = (map.width() as f32, map.height() as f32);
+            let player_tile = walkable
+                .iter()
+                .copied()
+                .min_by(|a, b| {
+                    let da = (a.x as f32 - w * 0.5).abs() + (a.z as f32 - h * 0.5).abs();
+                    let db = (b.x as f32 - w * 0.5).abs() + (b.z as f32 - h * 0.5).abs();
+                    da.total_cmp(&db)
+                })
+                .unwrap_or(Tile { x: 0, z: 0 });
+            let stride = (walkable.len() / (preset.count + 1)).max(1);
+            let npc_tiles: Vec<Tile> = walkable
+                .iter()
+                .step_by(stride)
+                .take(preset.count)
+                .copied()
+                .collect();
+            (
+                MapScene {
+                    pathfinder: Pathfinder::new(&map),
+                    map,
+                    scratch: Vec::new(),
+                    focus: BwVec3::new(w * 0.5, 0.0, h * 0.5),
+                    rng: Rng::new(seed ^ 0x5EED),
+                    resend: 0.0,
+                },
+                tile_center(player_tile),
+                npc_tiles
+                    .iter()
+                    .map(|&t| tile_center(t))
+                    .collect::<Vec<_>>(),
+            )
+        });
+        let home = map_scene
+            .as_ref()
+            .map_or(BwVec3::new(0.0, 0.0, 3.0), |(_, home, _)| *home);
         let player = build_rig(
             world,
             &skeleton,
-            Character::new(BwVec3::new(0.0, 0.0, 3.0), std::f32::consts::PI),
+            Character::new(home, std::f32::consts::PI),
             PLAYER_INK,
         );
-        // Ambient walkers: the same seeded scene builders the headless
-        // gallery and SVG renderer use, minus the driven figure.
         let mut npcs = Vec::new();
-        for (k, spec) in build_scene(&preset, seed).into_iter().enumerate() {
-            if k >= 7 {
-                break; // the meadow wants a handful, not the crowd
+        if let Some((_, _, npc_positions)) = &map_scene {
+            // Map wanderers: plain walkers on tiles — the ambient
+            // re-send system routes them; no circle scripts (they
+            // would stride through ponds).
+            for pos in npc_positions {
+                npcs.push(build_rig(
+                    world,
+                    &skeleton,
+                    Character::new(*pos, 0.0),
+                    NPC_INK,
+                ));
             }
-            let rig = build_rig(world, &skeleton, spec.character, NPC_INK);
-            world.entity_mut(rig.walker).insert(spec.path);
-            npcs.push(rig);
+        } else {
+            // Ambient walkers: the same seeded scene builders the
+            // headless gallery and SVG renderer use, minus the driven
+            // figure.
+            for (k, spec) in build_scene(&preset, seed).into_iter().enumerate() {
+                if k >= 7 {
+                    break; // the meadow wants a handful, not the crowd
+                }
+                let rig = build_rig(world, &skeleton, spec.character, NPC_INK);
+                world.entity_mut(rig.walker).insert(spec.path);
+                npcs.push(rig);
+            }
         }
         let kit = {
             let flat = |radius: f32| {
@@ -372,17 +484,23 @@ pub fn run(scene_id: &str, seed: u64, shot: Option<&str>) {
             };
             let ring_mesh = world.resource_mut::<Assets<Mesh>>().add(flat(0.55));
             let goal_mesh = world.resource_mut::<Assets<Mesh>>().add(flat(0.16));
+            let dot_mesh = world.resource_mut::<Assets<Mesh>>().add(flat(0.07));
             let ring_mat = world
                 .resource_mut::<Assets<StandardMaterial>>()
                 .add(unlit(SELECT_INK));
             let goal_mat = world
                 .resource_mut::<Assets<StandardMaterial>>()
                 .add(unlit(GOAL_INK));
+            let dot_mat = world
+                .resource_mut::<Assets<StandardMaterial>>()
+                .add(unlit(ROUTE_INK));
             MarkerKit {
                 ring_mesh,
                 ring_mat,
                 goal_mesh,
                 goal_mat,
+                dot_mesh,
+                dot_mat,
             }
         };
         // The player figure starts selected: mark it from frame one.
@@ -392,7 +510,7 @@ pub fn run(scene_id: &str, seed: u64, shot: Option<&str>) {
             },
             Mesh3d(kit.ring_mesh.clone()),
             MeshMaterial3d(kit.ring_mat.clone()),
-            Transform::from_xyz(0.0, 0.02, 3.0),
+            Transform::from_xyz(home.x, 0.02, home.z),
         ));
         Viewer {
             scene: scene_id.to_string(),
@@ -409,6 +527,9 @@ pub fn run(scene_id: &str, seed: u64, shot: Option<&str>) {
             ortho: true, // ADR 0006: orthographic is the tactical default
             edit_count: 0,
             kit,
+            map: map_scene.map(|(scene, _, _)| scene),
+            home,
+            pan_last: None,
         }
     };
     app.insert_resource(viewer)
@@ -419,6 +540,7 @@ pub fn run(scene_id: &str, seed: u64, shot: Option<&str>) {
             (
                 handle_input,
                 apply_selection_input,
+                map_wander,
                 markers_follow,
                 update_movement_alpha,
                 rig_follow,
@@ -526,6 +648,7 @@ fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<bevy::mesh::Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    viewer: Res<Viewer>,
 ) {
     // Scene camera: opens on the SVG establishing shot; the chase
     // camera eases in behind the walker on the first frames.
@@ -566,35 +689,84 @@ fn setup_scene(
         ..default()
     });
 
-    // The meadow: a 24×24 checkerboard of 1 m tiles.
-    let tile = meshes.add(bevy::mesh::Mesh::from(Plane3d::new(
-        Vec3::Y,
-        Vec2::splat(TILE * 0.5),
-    )));
-    let mat_a = materials.add(StandardMaterial {
-        base_color: TILE_A,
-        ..default()
-    });
-    let mat_b = materials.add(StandardMaterial {
-        base_color: TILE_B,
-        ..default()
-    });
-    for i in -TILES / 2..TILES / 2 {
-        for j in -TILES / 2..TILES / 2 {
-            let mat = if (i + j) % 2 == 0 {
-                mat_a.clone()
-            } else {
-                mat_b.clone()
-            };
-            commands.spawn((
-                Mesh3d(tile.clone()),
-                MeshMaterial3d(mat),
-                Transform::from_translation(Vec3::new(
-                    (i as f32 + 0.5) * TILE,
-                    0.0,
-                    (j as f32 + 0.5) * TILE,
-                )),
-            ));
+    // The ground: map scenes paint their generated terrain (soil
+    // checker, stone, water); circle scenes keep the 24×24 meadow
+    // checkerboard.
+    if let Some(map_scene) = &viewer.map {
+        let tile = meshes.add(bevy::mesh::Mesh::from(Plane3d::new(
+            Vec3::Y,
+            Vec2::splat(TILE * 0.5),
+        )));
+        let mat_a = materials.add(StandardMaterial {
+            base_color: TILE_A,
+            ..default()
+        });
+        let mat_b = materials.add(StandardMaterial {
+            base_color: TILE_B,
+            ..default()
+        });
+        let mat_stone = materials.add(StandardMaterial {
+            base_color: MAP_STONE,
+            ..default()
+        });
+        let mat_water = materials.add(StandardMaterial {
+            base_color: MAP_WATER,
+            alpha_mode: AlphaMode::Blend,
+            ..default()
+        });
+        for z in 0..map_scene.map.height() as i32 {
+            for x in 0..map_scene.map.width() as i32 {
+                let t = Tile { x, z };
+                let (mat, y) = match map_scene.map.terrain_at(t) {
+                    Some(bw_core::map::Terrain::Stone) => (mat_stone.clone(), 0.0),
+                    Some(bw_core::map::Terrain::Water) => (mat_water.clone(), -0.02),
+                    _ => (
+                        if (x + z) % 2 == 0 {
+                            mat_a.clone()
+                        } else {
+                            mat_b.clone()
+                        },
+                        0.0,
+                    ),
+                };
+                let c = tile_center(t);
+                commands.spawn((
+                    Mesh3d(tile.clone()),
+                    MeshMaterial3d(mat),
+                    Transform::from_xyz(c.x, y, c.z),
+                ));
+            }
+        }
+    } else {
+        let tile = meshes.add(bevy::mesh::Mesh::from(Plane3d::new(
+            Vec3::Y,
+            Vec2::splat(TILE * 0.5),
+        )));
+        let mat_a = materials.add(StandardMaterial {
+            base_color: TILE_A,
+            ..default()
+        });
+        let mat_b = materials.add(StandardMaterial {
+            base_color: TILE_B,
+            ..default()
+        });
+        for i in -TILES / 2..TILES / 2 {
+            for j in -TILES / 2..TILES / 2 {
+                let mat = if (i + j) % 2 == 0 {
+                    mat_a.clone()
+                } else {
+                    mat_b.clone()
+                };
+                commands.spawn((
+                    Mesh3d(tile.clone()),
+                    MeshMaterial3d(mat),
+                    Transform::from_translation(Vec3::new(
+                        (i as f32 + 0.5) * TILE,
+                        0.0,
+                        (j as f32 + 0.5) * TILE,
+                    )),
+                ));
+            }
         }
     }
 
@@ -631,6 +803,7 @@ fn update_movement_alpha(
     };
 }
 
+#[allow(clippy::too_many_arguments)] // a Bevy system's inputs are its API
 fn handle_input(
     keys: Res<ButtonInput<KeyCode>>,
     buttons: Res<ButtonInput<MouseButton>>,
@@ -640,6 +813,7 @@ fn handle_input(
     walkers: Query<(Entity, &Walker)>,
     rings: Query<Entity, With<SelectionRing>>,
     goals: Query<Entity, With<GoalMarker>>,
+    dots: Query<Entity, With<RouteDot>>,
     mut viewer: ResMut<Viewer>,
     mut pause: ResMut<MovementPause>,
     mut commands: Commands,
@@ -650,52 +824,129 @@ fn handle_input(
     if viewer_has_shot_plan(&viewer) {
         return;
     }
+    // Map camera pan: right-drag translates the free focus along the
+    // ground (the map viewer's one new camera capability — circle
+    // scenes keep the follow camera).
+    if viewer.map.is_some() {
+        let cursor = primary.single().ok().and_then(|w| w.cursor_position());
+        if buttons.pressed(MouseButton::Right)
+            && let (Some(last), Some(cur)) = (viewer.pan_last, cursor)
+            && let Ok((_, cam_tf)) = camera_q.single()
+        {
+            let (dx, dy) = (cur.x - last.x, cur.y - last.y);
+            // World-per-pixel under the FixedVertical ortho (zoom rides
+            // the scale); the map default.
+            let world_per_px = ORTHO_VIEW_H * viewer.zoom / WIN_H;
+            let right = cam_tf.right().xyz();
+            let up = cam_tf.up().xyz();
+            let delta = pan_delta(right, up, dx, dy, world_per_px);
+            if let Some(map_scene) = viewer.map.as_mut() {
+                map_scene.focus = clamp_focus(
+                    BwVec3::new(
+                        map_scene.focus.x + delta.x,
+                        0.0,
+                        map_scene.focus.z + delta.z,
+                    ),
+                    &map_scene.map,
+                );
+                viewer.edit_count += 1;
+            }
+        }
+        viewer.pan_last = cursor;
+    }
     // Clicks first: figure-under-cursor selects, ground sends.
-    if buttons.just_pressed(MouseButton::Left) {
-        if let Some((origin, dir)) = cursor_ray(&primary, &camera_q) {
-            let picked = pick_walker(origin, dir, walkers.iter());
-            match picked {
-                Some(hit) if hit != viewer.selected => {
-                    // Selecting takes the figure off its scripted ring
-                    // (a CirclePath would keep fighting the sends) and
-                    // moves the ring marker to it.
-                    commands.entity(hit).remove::<CirclePath>();
-                    viewer.selected = hit;
-                    viewer.edit_count += 1;
-                    for ring in rings.iter() {
-                        commands.entity(ring).despawn();
-                    }
-                    for goal in goals.iter() {
-                        commands.entity(goal).despawn();
-                    }
-                    spawn_selection_ring(&mut commands, &viewer.kit, hit);
+    if buttons.just_pressed(MouseButton::Left)
+        && let Some((origin, dir)) = cursor_ray(&primary, &camera_q)
+    {
+        let picked = pick_walker(origin, dir, walkers.iter());
+        match picked {
+            Some(hit) if hit != viewer.selected => {
+                // Selecting takes the figure off its scripted ring
+                // (a CirclePath would keep fighting the sends) and
+                // moves the ring marker to it.
+                commands.entity(hit).remove::<CirclePath>();
+                viewer.selected = hit;
+                viewer.edit_count += 1;
+                for ring in rings.iter() {
+                    commands.entity(ring).despawn();
                 }
-                Some(_) => {
-                    // Clicking the selected figure returns control to
-                    // the player figure.
-                    viewer.selected = viewer.player.walker;
-                    viewer.edit_count += 1;
-                    for ring in rings.iter() {
-                        commands.entity(ring).despawn();
-                    }
-                    for goal in goals.iter() {
-                        commands.entity(goal).despawn();
-                    }
-                    spawn_selection_ring(&mut commands, &viewer.kit, viewer.selected);
+                for goal in goals.iter() {
+                    commands.entity(goal).despawn();
                 }
-                None => {
-                    // Ground click: send the selected figure walking.
-                    if let Some(ground) = ground_point(origin, dir) {
-                        let goal = BwVec3::new(ground.x, 0.0, ground.z);
-                        commands.entity(viewer.selected).insert(MoveTarget {
-                            pos: goal,
-                            arrive: ARRIVE_RADIUS,
-                        });
-                        for goal_marker in goals.iter() {
-                            commands.entity(goal_marker).despawn();
+                spawn_selection_ring(&mut commands, &viewer.kit, hit);
+            }
+            Some(_) => {
+                // Clicking the selected figure returns control to
+                // the player figure.
+                viewer.selected = viewer.player.walker;
+                viewer.edit_count += 1;
+                for ring in rings.iter() {
+                    commands.entity(ring).despawn();
+                }
+                for goal in goals.iter() {
+                    commands.entity(goal).despawn();
+                }
+                spawn_selection_ring(&mut commands, &viewer.kit, viewer.selected);
+            }
+            None => {
+                // Ground click: send the selected figure walking —
+                // routed through A* on map scenes, straight-line
+                // MoveTarget on the meadow.
+                if let Some(ground) = ground_point(origin, dir) {
+                    let goal = BwVec3::new(ground.x, 0.0, ground.z);
+                    let selected = viewer.selected;
+                    let route = viewer.map.as_mut().and_then(|map_scene| {
+                        let from = walkers
+                            .get(selected)
+                            .map(|(_, w)| w.character.pos)
+                            .unwrap_or(goal);
+                        plan_route(map_scene, from, goal)
+                    });
+                    match route {
+                        Some(route) => {
+                            if let Some(&last) = route.last() {
+                                let end = tile_center(last);
+                                commands
+                                    .entity(viewer.selected)
+                                    .remove::<MoveTarget>()
+                                    .insert(FollowPath::new(route.clone()));
+                                for goal_marker in goals.iter() {
+                                    commands.entity(goal_marker).despawn();
+                                }
+                                for dot in dots.iter() {
+                                    commands.entity(dot).despawn();
+                                }
+                                spawn_goal_marker(&mut commands, &viewer.kit, viewer.selected, end);
+                                spawn_route_dots(
+                                    &mut commands,
+                                    &viewer.kit,
+                                    viewer.selected,
+                                    &route,
+                                );
+                                viewer.edit_count += 1;
+                            }
                         }
-                        spawn_goal_marker(&mut commands, &viewer.kit, viewer.selected, goal);
-                        viewer.edit_count += 1;
+                        None => {
+                            if viewer.map.is_none() {
+                                commands.entity(viewer.selected).insert(MoveTarget {
+                                    pos: goal,
+                                    arrive: ARRIVE_RADIUS,
+                                });
+                                for goal_marker in goals.iter() {
+                                    commands.entity(goal_marker).despawn();
+                                }
+                                spawn_goal_marker(
+                                    &mut commands,
+                                    &viewer.kit,
+                                    viewer.selected,
+                                    goal,
+                                );
+                                viewer.edit_count += 1;
+                            }
+                            // Map scenes: an unwalkable click (water,
+                            // blocked) is a refusal — no marker, no
+                            // route, nothing to show.
+                        }
                     }
                 }
             }
@@ -795,6 +1046,60 @@ fn spawn_goal_marker(commands: &mut Commands, kit: &MarkerKit, walker: Entity, p
     ));
 }
 
+/// Spawn the waypoint dots for a routed send (skip the start tile —
+/// the figure stands on it). Dots expire as the figure passes them.
+fn spawn_route_dots(commands: &mut Commands, kit: &MarkerKit, walker: Entity, route: &[Tile]) {
+    for (index, tile) in route.iter().enumerate().skip(1) {
+        let c = tile_center(*tile);
+        commands.spawn((
+            RouteDot { walker, index },
+            Mesh3d(kit.dot_mesh.clone()),
+            MeshMaterial3d(kit.dot_mat.clone()),
+            Transform::from_xyz(c.x, 0.025, c.z),
+        ));
+    }
+}
+
+/// Screen-space drag → ground-plane focus movement: the camera's
+/// right/up basis projected to the ground (an ortho camera over a
+/// flat plane maps ground motion to screen linearly, so the drag
+/// feels 1:1 at any zoom). Dragging right moves the world right,
+/// i.e. the focus left.
+fn pan_delta(right: Vec3, up: Vec3, dx: f32, dy: f32, world_per_px: f32) -> Vec3 {
+    let ground = |v: Vec3| Vec3::new(v.x, 0.0, v.z).normalize_or_zero();
+    (ground(right) * -dx + ground(up) * dy) * world_per_px
+}
+
+/// Keep the free camera's focus within the map (plus a tile of
+/// slack) — panning off the world is a bug feel, not a feature.
+fn clamp_focus(focus: BwVec3, map: &Map) -> BwVec3 {
+    BwVec3::new(
+        focus.x.clamp(-1.0, map.width() as f32 + 1.0),
+        0.0,
+        focus.z.clamp(-1.0, map.height() as f32 + 1.0),
+    )
+}
+
+/// Plan a routed send: ground point → goal tile, one A* query from
+/// the figure's tile. `None` when either end is unwalkable or no
+/// route connects (water clicks refuse). Event-driven by design —
+/// this runs in `Update` on click, never per tick.
+fn plan_route(map_scene: &mut MapScene, from_pos: BwVec3, to_point: BwVec3) -> Option<Vec<Tile>> {
+    let to = tile_of(to_point);
+    let from = tile_of(from_pos);
+    if !map_scene.map.walkable(from) || !map_scene.map.walkable(to) {
+        return None;
+    }
+    if map_scene
+        .pathfinder
+        .find_path_into(&map_scene.map, from, to, &mut map_scene.scratch)
+    {
+        Some(map_scene.scratch.clone())
+    } else {
+        None
+    }
+}
+
 /// Whether the smoke plan is active (resource presence, checked without
 /// a second system param so the chain stays uniform).
 fn viewer_has_shot_plan(_viewer: &Viewer) -> bool {
@@ -813,20 +1118,27 @@ fn apply_selection_input(
     mut viewer: ResMut<Viewer>,
     mut walkers: Query<&mut Walker>,
     goals: Query<Entity, With<GoalMarker>>,
+    dots: Query<Entity, With<RouteDot>>,
     mut commands: Commands,
 ) {
     if viewer.reset_pending {
         viewer.reset_pending = false;
         viewer.selected = viewer.player.walker;
-        commands.entity(viewer.player.walker).remove::<MoveTarget>();
+        commands
+            .entity(viewer.player.walker)
+            .remove::<MoveTarget>()
+            .remove::<FollowPath>();
         for goal in goals.iter() {
             commands.entity(goal).despawn();
+        }
+        for dot in dots.iter() {
+            commands.entity(dot).despawn();
         }
         let Ok(mut walker) = walkers.get_mut(viewer.player.walker) else {
             return;
         };
         let scale = walker.character.scale;
-        walker.character = Character::new(BwVec3::new(0.0, 0.0, 3.0), std::f32::consts::PI);
+        walker.character = Character::new(viewer.home, std::f32::consts::PI);
         walker.character.scale = scale;
         walker.input = MovementInput::default();
         return;
@@ -849,23 +1161,89 @@ fn apply_selection_input(
     };
     walker.input = viewer.input;
     if viewer.input != MovementInput::default() {
-        // Keyboard intent takes the channel back from a send.
-        commands.entity(viewer.selected).remove::<MoveTarget>();
+        // Keyboard intent takes the channel back from a send —
+        // straight-line or routed.
+        commands
+            .entity(viewer.selected)
+            .remove::<MoveTarget>()
+            .remove::<FollowPath>();
         for goal in goals.iter() {
             commands.entity(goal).despawn();
+        }
+        for dot in dots.iter() {
+            commands.entity(dot).despawn();
+        }
+    }
+}
+
+/// Map scenes only: every few seconds, wanderers whose route is spent
+/// (or who never had one) get a new short route to a nearby walkable
+/// tile — the lived-in-colony feel, and a standing demonstration that
+/// routes bend around water. The player figure is never auto-sent.
+fn map_wander(
+    time: Res<Time>,
+    mut viewer: ResMut<Viewer>,
+    walkers: Query<(Entity, &Walker)>,
+    routes: Query<&FollowPath>,
+    mut commands: Commands,
+) {
+    let player = viewer.player.walker;
+    let Some(map_scene) = viewer.map.as_mut() else {
+        return;
+    };
+    map_scene.resend += time.delta_secs();
+    if map_scene.resend < MAP_RESEND_EVERY {
+        return;
+    }
+    map_scene.resend = 0.0;
+    for (entity, walker) in walkers.iter() {
+        if entity == player {
+            continue;
+        }
+        if let Ok(route) = routes.get(entity)
+            && !route.is_finished()
+        {
+            continue;
+        }
+        let from = tile_of(walker.character.pos);
+        for _ in 0..8 {
+            let candidate = Tile {
+                x: from.x + (map_scene.rng.next_u64() % 25) as i32 - 12,
+                z: from.z + (map_scene.rng.next_u64() % 25) as i32 - 12,
+            };
+            let nearby = (candidate.x - from.x).abs() + (candidate.z - from.z).abs();
+            if nearby < 3 || !map_scene.map.walkable(candidate) {
+                continue;
+            }
+            if map_scene.pathfinder.find_path_into(
+                &map_scene.map,
+                from,
+                candidate,
+                &mut map_scene.scratch,
+            ) {
+                commands
+                    .entity(entity)
+                    .remove::<CirclePath>()
+                    .insert(FollowPath::new(map_scene.scratch.clone()));
+                break;
+            }
         }
     }
 }
 
 /// Marker housekeeping: the ring rides its selected figure (a stale
 /// one waits for its despawn command); the goal disc despawns when
-/// its walker's target is gone or arrived.
+/// its walker's target is gone or arrived — on map scenes, when its
+/// route is spent — and route dots expire as their waypoints pass.
+#[allow(clippy::too_many_arguments)] // a Bevy system's inputs are its API
 fn markers_follow(
     viewer: Res<Viewer>,
     walkers: Query<&Walker>,
     moves: Query<&MoveTarget>,
+    routes: Query<&FollowPath>,
     rings: Query<(Entity, &SelectionRing)>,
     goals: Query<(Entity, &GoalMarker)>,
+    dots: Query<(Entity, &RouteDot)>,
     mut transforms: Query<&mut Transform>,
     mut commands: Commands,
 ) {
@@ -873,22 +1251,36 @@ fn markers_follow(
         if ring.walker != viewer.selected {
             continue; // stale until the despawn command lands
         }
-        if let Ok(walker) = walkers.get(ring.walker) {
-            if let Ok(mut tf) = transforms.get_mut(entity) {
-                tf.translation = Vec3::new(walker.character.pos.x, 0.02, walker.character.pos.z);
-            }
+        if let (Ok(walker), Ok(mut tf)) = (walkers.get(ring.walker), transforms.get_mut(entity)) {
+            tf.translation = Vec3::new(walker.character.pos.x, 0.02, walker.character.pos.z);
         }
     }
     for (entity, goal) in goals.iter() {
-        let arrived = match (moves.get(goal.walker), walkers.get(goal.walker)) {
-            (Ok(mt), Ok(walker)) => {
-                let dx = mt.pos.x - walker.character.pos.x;
-                let dz = mt.pos.z - walker.character.pos.z;
-                (dx * dx + dz * dz).sqrt() <= mt.arrive
-            }
-            _ => true, // target gone (cancelled or replaced)
+        let arrived = match (moves.get(goal.walker), routes.get(goal.walker)) {
+            // Straight-line send: inside the arrival radius.
+            (Ok(mt), Err(_)) => match walkers.get(goal.walker) {
+                Ok(walker) => {
+                    let dx = mt.pos.x - walker.character.pos.x;
+                    let dz = mt.pos.z - walker.character.pos.z;
+                    (dx * dx + dz * dz).sqrt() <= mt.arrive
+                }
+                Err(_) => true,
+            },
+            // Routed send: the route is spent.
+            (_, Ok(route)) => route.is_finished(),
+            // Target gone (cancelled or replaced).
+            _ => true,
         };
         if arrived {
+            commands.entity(entity).despawn();
+        }
+    }
+    for (entity, dot) in dots.iter() {
+        let stale = match routes.get(dot.walker) {
+            Ok(route) => route.is_finished() || route.progress() > dot.index,
+            Err(_) => true, // route gone (cancelled or replaced)
+        };
+        if stale {
             commands.entity(entity).despawn();
         }
     }
@@ -962,7 +1354,9 @@ fn to_bevy(v: BwVec3) -> Vec3 {
 /// the eye→target direction held constant, tracking the selected
 /// figure at `FOLLOW_DIST` (× zoom) and easing between positions. The
 /// offline renders and the live view share an angle, so a pose that
-/// reads in one reads in the other.
+/// reads in one reads in the other. Map scenes keep the orientation
+/// but track the free pan focus instead of the selection — the
+/// colony-sim camera law (pan owns the frame).
 fn camera_follow(
     viewer: Res<Viewer>,
     mut state: ResMut<CameraState>,
@@ -973,12 +1367,15 @@ fn camera_follow(
     let Ok(mut transform) = camera.single_mut() else {
         return;
     };
-    let Ok(walker) = walkers.get(viewer.selected) else {
-        return;
+    let focus = if let Some(map_scene) = &viewer.map {
+        Vec3::new(map_scene.focus.x, 1.0, map_scene.focus.z)
+    } else {
+        let Ok(walker) = walkers.get(viewer.selected) else {
+            return;
+        };
+        Vec3::new(walker.character.pos.x, 1.0, walker.character.pos.z)
     };
-    let c = &walker.character;
     let dir = follow_dir();
-    let focus = Vec3::new(c.pos.x, 1.0, c.pos.z);
     let desired = focus + dir * (FOLLOW_DIST * viewer.zoom);
     let k = 1.0 - (-CAM_LERP * time.delta_secs()).exp();
     let (position, look) = match (state.position, state.look) {
@@ -997,10 +1394,10 @@ fn ortho_zoom(viewer: Res<Viewer>, mut projections: Query<&mut Projection, With<
     if !viewer.ortho {
         return;
     }
-    if let Ok(mut projection) = projections.single_mut() {
-        if let Projection::Orthographic(ortho) = &mut *projection {
-            ortho.scale = viewer.zoom.max(0.05);
-        }
+    if let Ok(mut projection) = projections.single_mut()
+        && let Projection::Orthographic(ortho) = &mut *projection
+    {
+        ortho.scale = viewer.zoom.max(0.05);
     }
 }
 
@@ -1060,11 +1457,20 @@ fn update_readout(
         ),
     };
     let cam = if viewer.ortho { "ortho" } else { "persp" };
-    let lines = [
-        format!(
-            "walker-playground  scene {}  seed {}  sel {sel}  {cam}",
-            viewer.scene, viewer.seed
-        ),
+    let mut lines = vec![format!(
+        "walker-playground  scene {}  seed {}  sel {sel}  {cam}",
+        viewer.scene, viewer.seed
+    )];
+    if let Some(map_scene) = &viewer.map {
+        lines.push(format!(
+            "map  walkable {}/{}  focus ({:2.0}, {:2.0})  free camera",
+            map_scene.map.walkable_count(),
+            map_scene.map.tile_count(),
+            map_scene.focus.x,
+            map_scene.focus.z
+        ));
+    }
+    lines.extend([
         format!(
             "speed {:4.2} m/s  gait {gait}  action {action}  carry {carry}  [{}]",
             c.speed,
@@ -1078,10 +1484,20 @@ fn update_readout(
             c.footfalls,
             viewer.npcs.len() + 1,
         ),
-        "click fig select · click ground send · W/S walk · Shift run".to_string(),
-        "A/D turn · Space jump · F punch · E reach · C carry · O ortho".to_string(),
-        "R reset  P pause  -/+ zoom  Esc quit".to_string(),
-    ];
+    ]);
+    if viewer.map.is_some() {
+        lines.extend([
+            "R-drag pan · click fig select · click ground ROUTES (A*) · W/S walk".to_string(),
+            "A/D turn · Space jump · F punch · E reach · C carry · O ortho".to_string(),
+            "R reset  P pause  -/+ zoom  Esc quit".to_string(),
+        ]);
+    } else {
+        lines.extend([
+            "click fig select · click ground send · W/S walk · Shift run".to_string(),
+            "A/D turn · Space jump · F punch · E reach · C carry · O ortho".to_string(),
+            "R reset  P pause  -/+ zoom  Esc quit".to_string(),
+        ]);
+    }
     let width = lines.iter().map(String::len).max().unwrap_or(0);
     text.0 = lines
         .iter()
@@ -1134,12 +1550,32 @@ const CARRY_WINDOW: (f32, f32) = (3.9, 4.4);
 const PUNCH_WINDOW: (f32, f32) = (5.0, 5.8);
 const PUNCH_ARC_TURN: f32 = 0.9; // rad/s through the punch window
 
+/// The map smoke's shot times (sim seconds): the generated terrain
+/// with its wanderers idle, mid-walk of a scripted routed send (dots
+/// down, goal disc at the far tile), arrival, and a scripted pan.
+const MAP_SHOTS: [(f32, &str); 4] = [
+    (1.3, "meadow"),
+    (3.0, "route"),
+    (6.0, "arrived"),
+    (7.0, "pan"),
+];
+const MAP_SHOT_EXIT_T: f32 = 7.6;
+/// The scripted routed send fires here: a walkable tile ~5 steps out
+/// (deterministic scan), so the walk (~3.7 s at cruise) lands before
+/// the arrival shot.
+const MAP_SEND_T: f32 = 2.0;
+/// The scripted pan fires here: the free focus jumps to the arrived
+/// player (the camera eases over), proving pan moves the frame.
+const MAP_PAN_T: f32 = 6.4;
+
 /// With `--viewer-shot`: auto-drive the figure (walk from 0.3 s, hop at
 /// 2.0 s, walk-reaches 2.8–3.7 s, chest carry 3.9–4.4 s, run from 4.5 s,
 /// punch from 5.0 s, click-to-move send at 6.6 s, perspective camera at
 /// 7.9 s), capture the eight shots, exit — the viewer's headless-ish
 /// verification hook, sim-time driven so captures are refresh-rate
-/// independent.
+/// independent. Map scenes run their own script: idle terrain, one
+/// routed send with dots, arrival, and a scripted pan.
+#[allow(clippy::too_many_arguments)] // a Bevy system's inputs are its API
 fn auto_screenshot(
     plan: Option<Res<ShotPlan>>,
     mut viewer: ResMut<Viewer>,
@@ -1156,9 +1592,72 @@ fn auto_screenshot(
         Ok(walker) => walker.character.t,
         Err(_) => return,
     };
+    let map_mode = viewer.map.is_some();
+    if map_mode {
+        // Scripted routed send: a deterministic walkable tile a few
+        // steps out, planned through the same A* a click uses.
+        if !*sent && t >= MAP_SEND_T {
+            *sent = true;
+            let player = viewer.player.walker;
+            if let Some(map_scene) = viewer.map.as_mut() {
+                let Ok(walker) = walkers.get(player) else {
+                    return;
+                };
+                let from_t = tile_of(walker.character.pos);
+                let (w, h) = (map_scene.map.width() as i32, map_scene.map.height() as i32);
+                let mut goal = None;
+                'search: for dz in 0..4i32 {
+                    for dx in 0..4i32 {
+                        let candidate = Tile {
+                            x: (from_t.x + 5 + dx).min(w - 2),
+                            z: (from_t.z + dz).min(h - 2),
+                        };
+                        let distance =
+                            (candidate.x - from_t.x).abs() + (candidate.z - from_t.z).abs();
+                        if distance >= 4 && map_scene.map.walkable(candidate) {
+                            goal = Some(candidate);
+                            break 'search;
+                        }
+                    }
+                }
+                if let Some(goal) = goal
+                    && let Some(route) =
+                        plan_route(map_scene, walker.character.pos, tile_center(goal))
+                    && let Some(&last) = route.last()
+                {
+                    let end = tile_center(last);
+                    commands
+                        .entity(viewer.player.walker)
+                        .insert(FollowPath::new(route.clone()));
+                    spawn_goal_marker(&mut commands, &viewer.kit, viewer.player.walker, end);
+                    spawn_route_dots(&mut commands, &viewer.kit, viewer.player.walker, &route);
+                }
+            }
+        }
+        // Scripted pan: jump the free focus to the arrived player.
+        let player = viewer.player.walker;
+        if t >= MAP_PAN_T
+            && let Some(map_scene) = viewer.map.as_mut()
+            && let Ok(walker) = walkers.get(player)
+        {
+            map_scene.focus = clamp_focus(walker.character.pos, &map_scene.map);
+        }
+        for (k, (at, tag)) in MAP_SHOTS.iter().enumerate() {
+            if !fired[k] && t >= *at {
+                fired[k] = true;
+                commands
+                    .spawn(Screenshot::primary_window())
+                    .observe(save_to_disk(shot_variant(&plan.path, tag)));
+            }
+        }
+        if t >= MAP_SHOT_EXIT_T {
+            exit.write(AppExit::Success);
+        }
+        return;
+    }
     // Auto-drive: walk, then run, then a scripted send (actions and
     // carries compose with the gait by construction).
-    if t >= 0.3 && t < SHOT_SEND_T {
+    if (0.3..SHOT_SEND_T).contains(&t) {
         viewer.input.target_speed = if t >= RUN_START {
             RUN_SPEED
         } else {
@@ -1307,7 +1806,9 @@ mod tests {
     fn ground_point_hits_the_plane_and_rejects_strays() {
         let origin = Vec3::new(3.0, 5.0, 2.0);
         let dir = Vec3::new(0.0, -1.0, -0.5).normalize();
-        let hit = ground_point(origin, dir).expect("downward ray must hit");
+        let Some(hit) = ground_point(origin, dir) else {
+            panic!("downward ray must hit");
+        };
         assert!(hit.y.abs() < 1e-4, "hit off the plane: {hit:?}");
         // The hit lies along the ray, at the y = 0 crossing.
         let t = (hit - origin).dot(dir);
@@ -1317,6 +1818,12 @@ mod tests {
         assert_eq!(ground_point(origin, Vec3::new(1.0, 0.0, 0.0)), None);
         // Pointing up and away: the crossing is behind the origin.
         assert_eq!(ground_point(origin, Vec3::new(0.0, 1.0, 0.0)), None);
+    }
+
+    /// Test entity from a raw id (bevy 0.19 hands back an Option; raw
+    /// ids this small always convert).
+    fn ent(n: u32) -> Entity {
+        Entity::from_raw_u32(n).unwrap_or(Entity::PLACEHOLDER)
     }
 
     /// Walker picking: the ray takes the figure under it — and when
@@ -1338,30 +1845,18 @@ mod tests {
         // far figure directly behind it.
         let origin = Vec3::new(0.0, 8.0, 4.0);
         let dir = (Vec3::new(0.0, 0.5, 0.0) - origin).normalize();
-        let hit = pick_walker(
+        let Some(hit) = pick_walker(
             origin,
             dir,
-            [
-                (Entity::from_raw_u32(1).unwrap(), &near),
-                (Entity::from_raw_u32(2).unwrap(), &far),
-                (Entity::from_raw_u32(3).unwrap(), &side),
-            ]
-            .into_iter(),
-        )
-        .expect("ray over the near figure must pick it");
-        assert_eq!(
-            hit,
-            Entity::from_raw_u32(1).unwrap(),
-            "nearest along the ray wins"
-        );
+            [(ent(1), &near), (ent(2), &far), (ent(3), &side)].into_iter(),
+        ) else {
+            panic!("ray over the near figure must pick it");
+        };
+        assert_eq!(hit, ent(1), "nearest along the ray wins");
         // A ray into open meadow picks nothing.
         let miss = Vec3::new(0.9, -1.0, 0.2).normalize();
         assert_eq!(
-            pick_walker(
-                origin,
-                miss,
-                [(Entity::from_raw_u32(1).unwrap(), &near)].into_iter()
-            ),
+            pick_walker(origin, miss, [(ent(1), &near)].into_iter()),
             None
         );
     }
@@ -1377,5 +1872,88 @@ mod tests {
         for spec in &specs {
             assert!(spec.path.radius > 0.0);
         }
+    }
+
+    /// Map scenes exist and carry their generation params (viewer-only
+    /// scenes; main refuses them elsewhere).
+    #[test]
+    fn map_scene_presets_carry_params() {
+        for id in ["map", "map-archipelago"] {
+            let Some(preset) = scene_preset(id) else {
+                panic!("{id} preset missing");
+            };
+            let params = preset
+                .map
+                .unwrap_or_else(|| panic!("{id} needs map params"));
+            assert!(params.width > 0 && params.height > 0);
+        }
+        assert!(scene_preset("walk").is_some_and(|p| p.map.is_none()));
+    }
+
+    /// Pan feel — the grab-the-map metaphor, consistently: the world
+    /// rides the cursor, so the focus moves against the drag in both
+    /// axes (drag right: focus left-screen; drag down: focus
+    /// up-screen, revealing what was above). A vertical basis (pure
+    /// top-down) contributes no ground motion.
+    #[test]
+    fn pan_delta_tracks_the_cursor() {
+        // Camera basis at the ADR 0006 orientation: looking down the
+        // −tactical direction, up tilted skyward.
+        let dir = bw_core::camera::tactical_dir();
+        let fwd = Vec3::new(-dir.x, -dir.y, -dir.z);
+        let right = fwd.cross(Vec3::Y).normalize();
+        let up = right.cross(fwd);
+        // Drag right 100 px at 8 m / 800 px: one meter of focus travel.
+        let d = pan_delta(right, up, 100.0, 0.0, 8.0 / 800.0);
+        assert!((d.length() - 1.0).abs() < 1e-4, "{d:?}");
+        assert!(d.dot(right) < 0.0, "focus must move against the drag");
+        // Drag down 100 px: the world slides down-screen, so the focus
+        // climbs toward the camera's up.
+        let d = pan_delta(right, up, 0.0, 100.0, 8.0 / 800.0);
+        assert!(
+            d.dot(up) > 0.0,
+            "down-drag must reveal what was above: {d:?}"
+        );
+        // Vertical basis components contribute nothing: a camera
+        // whose right points skyward gets no ground motion from an
+        // x-drag.
+        assert_eq!(pan_delta(Vec3::Y, Vec3::Y, 100.0, 0.0, 1.0), Vec3::ZERO);
+    }
+
+    /// Routed sends plan like clicks: walkable targets connect through
+    /// A*, water clicks refuse, and the focus stays inside the map.
+    #[test]
+    fn plan_route_routes_walkable_and_refuses_water() {
+        let map = Map::generate(42, bw_core::map::GenParams::default());
+        let mut map_scene = MapScene {
+            pathfinder: Pathfinder::new(&map),
+            map,
+            scratch: Vec::new(),
+            focus: BwVec3::new(32.0, 0.0, 32.0),
+            rng: Rng::new(1),
+            resend: 0.0,
+        };
+        // A walkable target: the route is 4-adjacent, start-inclusive.
+        let start = tile_center(Tile { x: 4, z: 4 });
+        let Some(route) = plan_route(&mut map_scene, start, tile_center(Tile { x: 10, z: 4 }))
+        else {
+            panic!("walkable targets must route");
+        };
+        assert_eq!(route.first(), Some(&Tile { x: 4, z: 4 }));
+        assert_eq!(route.last(), Some(&Tile { x: 10, z: 4 }));
+        for pair in route.windows(2) {
+            let d = (pair[0].x - pair[1].x).abs() + (pair[0].z - pair[1].z).abs();
+            assert_eq!(d, 1);
+        }
+        // A water click refuses (find a water tile on the meadow).
+        let water = (0..map_scene.map.height() as i32)
+            .flat_map(|z| (0..map_scene.map.width() as i32).map(move |x| Tile { x, z }))
+            .find(|t| map_scene.map.terrain_at(*t) == Some(bw_core::map::Terrain::Water));
+        if let Some(water) = water {
+            assert!(plan_route(&mut map_scene, start, tile_center(water)).is_none());
+        }
+        // The focus clamps inside the map's extent.
+        let clamped = clamp_focus(BwVec3::new(-50.0, 0.0, 500.0), &map_scene.map);
+        assert_eq!(clamped, BwVec3::new(-1.0, 0.0, 65.0));
     }
 }

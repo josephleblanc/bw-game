@@ -70,9 +70,11 @@ const RENDER_FPS: u32 = 24;
 pub const WALK_SPEED: f32 = 1.35;
 pub const RUN_SPEED: f32 = 3.6;
 
-/// Scene presets. Every scene is scripted circles: deterministic from
-/// `(scene, seed)` alone, shared by the harness, the SVG render, and
-/// the viewer's ambient walkers.
+/// Scene presets. Circle scenes are scripted circles: deterministic
+/// from `(scene, seed)` alone, shared by the harness, the SVG render,
+/// and the viewer's ambient walkers. Map scenes (`map` set) are
+/// viewer-only: the viewer generates the tile map and routes sends
+/// through A* (docs/maps/map-design.md, the map-viewer tier).
 pub struct ScenePreset {
     /// Walkers in the scene.
     pub count: usize,
@@ -84,6 +86,10 @@ pub struct ScenePreset {
     /// Assign carries round-robin (chest / side / none) — the carry
     /// channel's scene.
     pub carry: bool,
+    /// Map scenes: generation params for the tile map the viewer
+    /// builds (walkers stand on walkable tiles and wander; sends
+    /// route). `None` for circle scenes.
+    pub map: Option<bw_core::map::GenParams>,
 }
 
 fn scene_preset(id: &str) -> Option<ScenePreset> {
@@ -95,6 +101,7 @@ fn scene_preset(id: &str) -> Option<ScenePreset> {
             speed: (WALK_SPEED, WALK_SPEED),
             fixed: Some(WALK_SPEED),
             carry: false,
+            map: None,
         }),
         // The same ring at run speed: the gait blend's upper band.
         "walk-run" => Some(ScenePreset {
@@ -103,6 +110,7 @@ fn scene_preset(id: &str) -> Option<ScenePreset> {
             speed: (RUN_SPEED, RUN_SPEED),
             fixed: Some(RUN_SPEED),
             carry: false,
+            map: None,
         }),
         // Porters on nested rings, carrying round-robin: chest holds,
         // side holds, and empty-handed — the loaded-walk read, with
@@ -113,6 +121,7 @@ fn scene_preset(id: &str) -> Option<ScenePreset> {
             speed: (1.1, 1.6),
             fixed: None,
             carry: true,
+            map: None,
         }),
         // A crowd of 96 seeded walkers on nested rings — the
         // perf-heavy scene (96 × 13 = 1248 bone segments).
@@ -122,6 +131,37 @@ fn scene_preset(id: &str) -> Option<ScenePreset> {
             speed: (0.9, 2.4),
             fixed: None,
             carry: false,
+            map: None,
+        }),
+        // The map viewer's meadow: the default generation — walkers
+        // wander it and sends route through A* (viewer-only; headless
+        // map reports live in bw-map-gallery).
+        "map" => Some(ScenePreset {
+            count: 7,
+            radius: (0.0, 0.0),
+            speed: (WALK_SPEED, WALK_SPEED),
+            fixed: Some(WALK_SPEED),
+            carry: false,
+            map: Some(bw_core::map::GenParams::default()),
+        }),
+        // The map viewer's archipelago: wet, chunky — routing reads
+        // loud when paths bend around water.
+        "map-archipelago" => Some(ScenePreset {
+            count: 7,
+            radius: (0.0, 0.0),
+            speed: (WALK_SPEED, WALK_SPEED),
+            fixed: Some(WALK_SPEED),
+            carry: false,
+            map: Some(bw_core::map::GenParams {
+                octaves: 3,
+                scale: 5.0,
+                stone_threshold: 0.68,
+                water_fraction: 0.22,
+                temp_base_c: 24.0,
+                temp_span_c: 4.0,
+                temp_noise_c: 1.5,
+                ..bw_core::map::GenParams::default()
+            }),
         }),
         _ => None,
     }
@@ -343,6 +383,17 @@ fn main() {
     #[cfg(not(feature = "viewer"))]
     if args.viewer {
         eprintln!("bw-walker-gallery: --viewer needs a build with --features viewer (dev-only)");
+        std::process::exit(2);
+    }
+
+    // Map scenes live only in the viewer (terrain, routed sends); the
+    // headless map reports and SVG renders are bw-map-gallery's.
+    if scene_preset(&args.scene).is_some_and(|p| p.map.is_some()) {
+        eprintln!(
+            "bw-walker-gallery: scene {} is viewer-only — maps render live (--viewer); \
+             headless map output lives in bw-map-gallery",
+            args.scene
+        );
         std::process::exit(2);
     }
 

@@ -4,8 +4,12 @@ The fourth gallery: generated tile maps from `bw_core::map`, tier 2
 of [the map design](../../docs/maps/map-design.md) — headless scenes
 plus the tactical SVG ortho render. No engine dependency at this
 tier: the map is static, so there is no ECS to drive and no tick to
-step (per-tick work arrives with pathfinding, and the live viewer
-with walkers on maps after that).
+step. Pathfinding (`bw_core::path::Pathfinder`, zero-alloc A*)
+arrived with tier 3 and is exercised by this crate's tests; the
+**live map viewer** — walkers standing on generated terrain,
+click-to-send routed through A*, right-drag pan — lives in the
+walker playground: `cargo run -p bw-walker-gallery --features
+viewer -- --viewer --scene map`.
 
 ## Scenes
 
