@@ -319,3 +319,8 @@ protection — required status checks — is not available for private
 repos on a free plan; until the repo goes public or the account upgrades,
 the required-check half of D7 is unwired: CI fails loudly, but nothing
 mechanically blocks a red merge.
+
+The repo went public later the same day and protection is set: required
+check `ci`, strict (branches must be up to date with main before
+merging), admins not enforced — solo pragmatism; the gate still runs on
+every push. D7 is now fully wired.
