@@ -38,6 +38,7 @@ use bevy::prelude::*;
 use bw_core::gallery::AllocStats;
 use bw_core::gallery::{FrameStats, PerfReport};
 use bw_core::sim::{Sim, SpatialGrid};
+use bw_core::time::SIM_DT;
 
 /// Scene presets: the id fixes the entity count and arena.
 fn scene_preset(id: &str) -> Option<(usize, f32, f32)> {
@@ -212,7 +213,7 @@ fn main() {
         // instead of allocating silently mid-frame (ADR 0004).
         pairs: Vec::with_capacity(count),
     })
-    .insert_resource(TickConfig { dt: 1.0 / 60.0 })
+    .insert_resource(TickConfig { dt: SIM_DT })
     .insert_resource(Stats::default())
     .add_systems(Update, (step_sim, sync_positions).chain());
 

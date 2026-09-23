@@ -10,7 +10,7 @@ use bw_core::sim::{Sim, SpatialGrid};
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
 const TICKS: usize = 100;
-const DT: f32 = 1.0 / 60.0;
+const DT: f32 = bw_core::time::SIM_DT;
 
 #[test]
 fn steady_state_sim_grid_and_query_allocate_nothing() {

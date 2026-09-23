@@ -281,8 +281,8 @@ mod tests {
         let mut a = Sim::seeded(500, 42, 100.0, 100.0);
         let mut b = Sim::seeded(500, 42, 100.0, 100.0);
         for _ in 0..600 {
-            a.step(1.0 / 60.0);
-            b.step(1.0 / 60.0);
+            a.step(crate::time::SIM_DT);
+            b.step(crate::time::SIM_DT);
         }
         assert_eq!(a.state_checksum(), b.state_checksum());
     }
@@ -306,7 +306,7 @@ mod tests {
     fn sim_keeps_entities_inside_bounds() {
         let mut sim = Sim::seeded(200, 1, 64.0, 32.0);
         for _ in 0..2000 {
-            sim.step(1.0 / 60.0);
+            sim.step(crate::time::SIM_DT);
         }
         for i in 0..sim.len() {
             assert!((0.0..=64.0).contains(&sim.xs[i]));
@@ -362,7 +362,7 @@ mod tests {
         let mut sim = Sim::seeded(400, 5, 40.0, 40.0);
         let mut reused = SpatialGrid::new(40.0, 40.0, 1.0, sim.len());
         for _ in 0..50 {
-            sim.step(1.0 / 60.0);
+            sim.step(crate::time::SIM_DT);
             reused.rebuild(&sim.xs, &sim.ys);
             let mut fresh = SpatialGrid::new(40.0, 40.0, 1.0, sim.len());
             fresh.rebuild(&sim.xs, &sim.ys);

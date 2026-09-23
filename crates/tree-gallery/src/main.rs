@@ -39,6 +39,7 @@ use bevy::prelude::*;
 #[cfg(feature = "perf-alloc")]
 use bw_core::gallery::AllocStats;
 use bw_core::gallery::{FrameStats, PerfReport};
+use bw_core::time::SIM_DT;
 use bw_core::tree::{CALM_WIND, Tree, TreeParams, TreePose, WindParams};
 
 mod proj;
@@ -370,10 +371,7 @@ fn main() {
         poses: scene.poses,
         wind: preset.wind,
     })
-    .insert_resource(SimClock {
-        t: 0.0,
-        dt: 1.0 / 60.0,
-    })
+    .insert_resource(SimClock { t: 0.0, dt: SIM_DT })
     .add_systems(Update, (step_trees, sync_segments).chain());
 
     // Spawn one Segment entity per tree node, carrying its (tree, node)

@@ -5,7 +5,7 @@
 
 use bw_core::sim::{Sim, SpatialGrid};
 
-const DT: f32 = 1.0 / 60.0;
+const DT: f32 = bw_core::time::SIM_DT;
 const RADIUS: f32 = 1.0;
 
 fn setup_sim_1000() -> Sim {

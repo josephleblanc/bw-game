@@ -10,7 +10,7 @@ use bw_core::tree::{CALM_WIND, Tree, TreeParams, TreePose};
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
 const TICKS: usize = 600;
-const DT: f32 = 1.0 / 60.0;
+const DT: f32 = bw_core::time::SIM_DT;
 
 #[test]
 fn steady_state_tree_pose_allocates_nothing() {

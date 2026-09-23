@@ -7,6 +7,7 @@
 pub mod gallery;
 pub mod sim;
 pub mod stats;
+pub mod time;
 pub mod tree;
 
 /// Probe runtime for `#[alloc_probe]` (ADR 0004, D4). Feature-gated: the
