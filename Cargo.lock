@@ -1493,6 +1493,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bw-map-gallery"
+version = "0.1.0"
+dependencies = [
+ "alloc-probe",
+ "bw-core",
+ "serde_json",
+]
+
+[[package]]
 name = "bw-tree-gallery"
 version = "0.1.0"
 dependencies = [

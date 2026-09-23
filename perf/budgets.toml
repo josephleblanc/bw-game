@@ -5,13 +5,13 @@
 # why. Ratcheting down is always allowed.
 
 schema = 1
-reviewed = "2026-09-22"
+reviewed = "2026-09-23"
 
 [scope]
 # Workspace members whose dependency graphs count toward the dep budget.
 # Tooling (xtask) stays out so its dependencies never count against the
 # game's footprint.
-measured_members = ["bw-core", "bw-demo", "bw-tree-gallery", "bw-walker-gallery"]
+measured_members = ["bw-core", "bw-demo", "bw-tree-gallery", "bw-walker-gallery", "bw-map-gallery"]
 
 [artifact.bw-demo]
 # size-profile native binary, host target. Bevy minimal + sim core +
@@ -35,6 +35,15 @@ note = "bevy 0.19.1 minimal + tree core + headless gallery harness + SVG render 
 # renderer. Measured 1,149,080 bytes at introduction.
 budget_bytes = 1180000
 note = "bevy 0.19.1 minimal + character core + movement plugin + headless gallery harness + 3D-projected SVG render path (ADR 0002/0003/0004)"
+
+[artifact.bw-map-gallery]
+# size-profile native binary, host target. Engine-free at this tier (the
+# map is static — no ECS, no tick): bw-core + serde_json only, so the
+# graph is a strict subset of the other galleries' and the binary is a
+# third the size. Bevy enters when walkers stand on maps (viewer tier).
+# Measured 358,240 bytes at introduction.
+budget_bytes = 365000
+note = "bw-core + serde_json only (no engine at this tier): map core + headless scene harness + tactical SVG ortho render (ADR 0002/0003/0004)"
 
 [deps]
 # 12 -> 78 external crates with bevy minimal (ADR 0002). Further raises are

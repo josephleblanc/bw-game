@@ -1,0 +1,24 @@
+[package]
+name = "bw-map-gallery"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+bw-core.workspace = true
+serde_json.workspace = true
+# Probe attribute for the perf-alloc pass (ADR 0004); optional so the
+# default graph stays bw-core + serde_json — this gallery owns no
+# engine dependency until walkers stand on maps (the viewer tier).
+alloc-probe = { workspace = true, optional = true }
+
+[features]
+# Allocation pass build (ADR 0003): separate build/run so the tracking
+# allocator never perturbs timing measurements (D8.8). The pass
+# measures generation — the map's one real cost until pathfinding
+# queries arrive (tier 3 of docs/maps/map-design.md).
+perf-alloc = ["dep:alloc-probe", "bw-core/perf-alloc"]
+
+[lints]
+workspace = true

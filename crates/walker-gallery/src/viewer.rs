@@ -75,22 +75,11 @@ const WIN_H: f32 = 800.0;
 const TILE: f32 = 1.0;
 const TILES: i32 = 24;
 
-/// Tactical camera orientation (ADR 0006): azimuth 49° off the +z
-/// axis toward +x and ~15.5° elevation — the SVG establishing shot's
-/// steepness, but deliberately off the 45° diagonal so the
-/// checkerboard doesn't read as a perfectly regular wallpaper (one
-/// family of tile edges dominates; the asymmetric faces also give the
-/// view a directional hierarchy, the same trick isometric-style games
-/// use when they offset the classic angle).
-const CAM_AZIMUTH_DEG: f32 = 49.0;
-const CAM_ELEVATION_DEG: f32 = 15.5;
-
-/// The follow-camera offset direction (unit; a test pins azimuth and
-/// elevation so this and the ADR can't drift apart).
+/// The follow-camera offset direction — `bw_core::camera`'s shared
+/// ADR 0006 orientation (the same constants the map gallery's SVG
+/// projection reads, so the surfaces can't drift).
 fn follow_dir() -> Vec3 {
-    let az = CAM_AZIMUTH_DEG.to_radians();
-    let el = CAM_ELEVATION_DEG.to_radians();
-    Vec3::new(el.cos() * az.sin(), el.sin(), el.cos() * az.cos())
+    bw_core::camera::tactical_dir()
 }
 /// Follow distance at zoom 1 (m). Meaningful to the perspective
 /// projection; the default orthographic camera frames by view height
@@ -1280,7 +1269,9 @@ mod tests {
 
     /// The follow camera holds the ADR 0006 orientation: unit length,
     /// azimuth 49° off +z toward +x (off the 45° diagonal — the tile
-    /// wallpaper breaker), elevation ~15.5°, at a sane range.
+    /// wallpaper breaker), elevation ~15.5°, at a sane range. The
+    /// constants live in `bw_core::camera` now — this pins the viewer
+    /// to them.
     #[test]
     fn follow_camera_holds_the_tactical_orientation() {
         let d = follow_dir();
@@ -1291,11 +1282,11 @@ mod tests {
         let azimuth = d.x.atan2(d.z).to_degrees();
         let elevation = d.y.asin().to_degrees();
         assert!(
-            (azimuth - CAM_AZIMUTH_DEG).abs() < 0.01,
+            (azimuth - bw_core::camera::TACTICAL_AZIMUTH_DEG).abs() < 0.01,
             "azimuth drifted: {azimuth}"
         );
         assert!(
-            (elevation - CAM_ELEVATION_DEG).abs() < 0.01,
+            (elevation - bw_core::camera::TACTICAL_ELEVATION_DEG).abs() < 0.01,
             "elevation drifted: {elevation}"
         );
         assert!(azimuth != 45.0, "back on the 45° diagonal");

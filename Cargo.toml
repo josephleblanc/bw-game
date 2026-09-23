@@ -1,7 +1,7 @@
 [workspace]
 # xtask is a member (so `cargo run -p xtask` and `--workspace` see it) but not
 # a default target; reach it via the `cargo xtask` alias in .cargo/config.toml.
-members = ["crates/alloc-probe","crates/core","crates/demo","crates/tree-gallery","crates/walker-gallery","xtask"]
+members = ["crates/alloc-probe","crates/core","crates/demo","crates/map-gallery","crates/tree-gallery","crates/walker-gallery","xtask"]
 default-members = ["crates/demo"]
 resolver = "2"
 

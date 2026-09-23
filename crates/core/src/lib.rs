@@ -4,6 +4,7 @@
 //! benchmarkable without the engine and insulated from engine churn; Bevy
 //! glue lives in the gallery binaries.
 
+pub mod camera;
 pub mod character;
 pub mod gallery;
 pub mod map;
