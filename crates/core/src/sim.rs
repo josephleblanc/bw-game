@@ -4,6 +4,15 @@
 //! under Bevy in the gallery binaries and under criterion/iai-callgrind in
 //! the benches.
 
+/// The splitmix64 finalizer — the avalanche `Rng::next_u64` runs its
+/// state through, as a pure function. Shared so random-access hashes
+/// (the map's lattice noise) use the same mixing law as the stream.
+pub fn splitmix_mix(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 /// splitmix64 — small, fast, deterministic. Adequate for scene generation;
 /// not cryptographic.
 #[derive(Debug, Clone)]
@@ -18,10 +27,7 @@ impl Rng {
 
     pub fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
+        splitmix_mix(self.state)
     }
 
     /// Uniform in `[0, 1)`.

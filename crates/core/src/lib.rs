@@ -6,6 +6,7 @@
 
 pub mod character;
 pub mod gallery;
+pub mod map;
 pub mod math;
 pub mod sim;
 pub mod stats;
