@@ -71,3 +71,11 @@ recovery.
   pointer-hostile).
 - Evidence for future storage decisions accumulates as case studies under
   `docs/case-studies/`.
+
+## Implementation notes
+
+- Enforcement split as of 2026-09-22: the mechanical half is ADR 0004's
+  (`[steady.*]` budgets, `tests/steady_alloc.rs`, `#[alloc_probe]`
+  attribution via `cargo xtask perf dhat`); this ADR's layout half — flat
+  vs nested, inline vs boxed — is design-review time. First
+  evidence-backed reference: case study 0001.

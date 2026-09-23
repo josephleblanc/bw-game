@@ -299,3 +299,12 @@ Phased so each step lands with the work that needs it:
 - **Phase 3 — multiple demos/assets**: `perf-trend.yml` weekly job, `perf-data`
   branch history, dhat/tracking-allocator memory pass, `release.yml` with the
   budget-green gate, biweekly review ritual.
+
+Status 2026-09-22: Phases 0–2 landed (32a1214, 2eee22f, 9f39aa6). The
+Phase 3 dhat memory pass landed with the allocation-policy work
+(05cbf79…8b959b5) — the alloc pass runs inside `perf measure`/`check`,
+gates via `[steady.*]` budgets, and `cargo xtask perf dhat` inspects it
+per scene; the `alloc_probe` macro landed with it. The remaining Phase 3
+items — `perf-trend.yml`, the `perf-data` branch, `release.yml`, CI
+wiring, the review ritual — all presuppose a hosted remote; until one
+exists, `cargo xtask perf check` remains the CI.

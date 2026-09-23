@@ -74,6 +74,23 @@ pub fn dispatch(args: &[String]) -> Result<u8> {
             )?;
             Ok(0)
         }
+        "dhat" => {
+            let flags = parse_flags(rest, &["--scene", "--ticks", "--seed", "--top"])?;
+            let top: usize = flags
+                .get("--top")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8);
+            dhat_pass(
+                flags.get("--scene").map(String::as_str),
+                flags
+                    .get("--ticks")
+                    .map(String::as_str)
+                    .unwrap_or(PERF_TICKS),
+                flags.get("--seed").map(String::as_str).unwrap_or(PERF_SEED),
+                top,
+            )?;
+            Ok(0)
+        }
         _ => {
             print_usage();
             Ok(2)
@@ -86,7 +103,8 @@ fn print_usage() {
         "usage:\n  \
          cargo xtask perf measure [--profile <name>] [--out <file>] [--runner <name>]\n  \
          cargo xtask perf check [--budgets <file>] [--profile <name>]\n  \
-         cargo xtask perf attribute [--top <n>] [--profile <name>]"
+         cargo xtask perf attribute [--top <n>] [--profile <name>]\n  \
+         cargo xtask perf dhat [--scene <id>] [--ticks <n>] [--seed <n>] [--top <n>]"
     );
 }
 
@@ -354,6 +372,14 @@ fn gather(profile: &str, runner: String) -> Result<Record> {
             Ok(_) => {
                 memory_skip = None;
                 for scene in &scenes {
+                    let dhat_report = meta
+                        .target_directory
+                        .join("perf")
+                        .join("dhat")
+                        .join(format!("{member}-{scene}.json"));
+                    let Some(dhat_report_str) = dhat_report.to_str() else {
+                        continue;
+                    };
                     let out = run_capture(
                         &root,
                         bin_str,
@@ -366,6 +392,8 @@ fn gather(profile: &str, runner: String) -> Result<Record> {
                             "--seed",
                             PERF_SEED,
                             "--perf-alloc",
+                            "--dhat-out",
+                            dhat_report_str,
                             "--json",
                         ],
                     )?;
@@ -554,6 +582,178 @@ fn attribute(top: usize, profile: &str) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// Inspection tier (ADR 0004, D4): run the allocation pass for one or all
+/// gallery scenes and print the windows, per-function probes, and schedule
+/// residual. Informational — the steady-state *gate* lives in `perf check`;
+/// this is the tool for naming a culprit when the gate fires. Each run
+/// archives its dhat callsite report under `target/perf/dhat/`.
+fn dhat_pass(scene: Option<&str>, ticks: &str, seed: &str, top: usize) -> Result<()> {
+    let root = workspace_root();
+    let members = scope_members(&root)?;
+    let meta = cargo_metadata(&root)?;
+    let out_dir = meta.target_directory.join("perf").join("dhat");
+
+    let mut ran = 0usize;
+    for (member, bin) in member_bins(&meta, &members) {
+        eprintln!("building {member} (runtime profile, perf-alloc)…");
+        run_capture(
+            &root,
+            "cargo",
+            &[
+                "build",
+                "--profile",
+                "runtime",
+                "-p",
+                &member,
+                "--features",
+                "perf-alloc",
+            ],
+        )?;
+        let bin_path = meta.target_directory.join("runtime").join(&bin);
+        let Some(bin_str) = bin_path.to_str() else {
+            continue;
+        };
+        let Ok(scenes_out) = run_capture(&root, bin_str, &["--perf-scenes"]) else {
+            continue; // not a gallery binary
+        };
+        let scenes: Vec<&str> = scenes_out.split_whitespace().collect();
+        if let Some(want) = scene
+            && !scenes.contains(&want)
+        {
+            bail!(
+                "{member}: unknown scene {want} (have: {})",
+                scenes.join(", ")
+            );
+        }
+        for s in &scenes {
+            if let Some(want) = scene
+                && *s != want
+            {
+                continue;
+            }
+            let report = out_dir.join(format!("{member}-{s}.json"));
+            let Some(report_str) = report.to_str() else {
+                continue;
+            };
+            let out = run_capture(
+                &root,
+                bin_str,
+                &[
+                    "--perf-headless",
+                    "--scene",
+                    s,
+                    "--ticks",
+                    ticks,
+                    "--seed",
+                    seed,
+                    "--perf-alloc",
+                    "--dhat-out",
+                    report_str,
+                    "--json",
+                ],
+            )?;
+            let value = parse_perf_json(&out)
+                .context("gallery alloc pass produced no parsable JSON report")?;
+            print_dhat_summary(&member, s, &value, top, &report)?;
+            ran += 1;
+        }
+    }
+    if ran == 0 {
+        bail!("no gallery scenes ran (no gallery binaries with a headless contract found)");
+    }
+    Ok(())
+}
+
+/// Human summary of one scene's allocation report: window totals, the
+/// steady-state series, top probes, engine residual, and leak drift.
+fn print_dhat_summary(
+    member: &str,
+    scene: &str,
+    value: &serde_json::Value,
+    top: usize,
+    report: &Path,
+) -> Result<()> {
+    let detail = value
+        .pointer("/alloc_detail")
+        .context("alloc pass output missing alloc_detail")?;
+    let num = |pointer: &str| -> Result<f64> {
+        detail
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_f64)
+            .with_context(|| format!("alloc_detail missing {pointer}"))
+    };
+
+    println!(
+        "== {member}::{scene} ({} ticks, {} entities)",
+        num("/measured/ticks")? as u64,
+        value
+            .pointer("/entities")
+            .and_then(serde_json::Value::as_u64)
+            .context("report missing entities")?,
+    );
+    println!(
+        "   windows blocks: setup {} | warmup {} | measured {}",
+        budgets::fmt_num(num("/setup/blocks")? as u64),
+        budgets::fmt_num(num("/warmup/blocks")? as u64),
+        budgets::fmt_num(num("/measured/blocks")? as u64),
+    );
+    println!(
+        "   steady blocks/tick: p50 {:.1} / max {:.1}  (gate: cargo xtask perf check)",
+        num("/measured/blocks_per_tick/p50")?,
+        num("/measured/blocks_per_tick/max")?,
+    );
+    println!(
+        "   live bytes: {} -> {} (drift {:+.1} B/tick)",
+        budgets::fmt_num(num("/live/start")? as u64),
+        budgets::fmt_num(num("/live/end")? as u64),
+        num("/live/drift_bytes_per_tick")?,
+    );
+
+    let mut probes: Vec<(&String, (u64, u64))> = detail
+        .pointer("/measured_probes")
+        .and_then(serde_json::Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(name, v)| {
+                    let blocks = v.get("blocks")?.as_u64()?;
+                    let calls = v.get("calls")?.as_u64()?;
+                    Some((name, (blocks, calls)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    probes.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(b.0)));
+    println!("   probes (measured window, top {top} by blocks):");
+    for (name, (blocks, calls)) in probes.iter().take(top) {
+        println!(
+            "     {name:<24} {:>10} blocks  {:>7} calls",
+            budgets::fmt_num(*blocks),
+            budgets::fmt_num(*calls),
+        );
+    }
+    println!(
+        "   schedule residual: {} blocks over the run (engine machinery)",
+        budgets::fmt_num(num("/schedule_residual/blocks")? as u64),
+    );
+    println!(
+        "   total allocs {} | peak live {} bytes",
+        budgets::fmt_num(
+            value
+                .pointer("/allocs/count")
+                .and_then(serde_json::Value::as_u64)
+                .context("report missing allocs.count")?
+        ),
+        budgets::fmt_num(
+            value
+                .pointer("/allocs/peak_bytes")
+                .and_then(serde_json::Value::as_u64)
+                .context("report missing allocs.peak_bytes")?
+        ),
+    );
+    println!("   dhat callsite report: {}", report.display());
     Ok(())
 }
 

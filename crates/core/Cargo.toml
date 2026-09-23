@@ -9,6 +9,15 @@ publish.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Optional: dhat-rs machinery for the perf-alloc measurement build (ADR
+# 0004). Off by default — never in the shipped or timing graph.
+dhat = { workspace = true, optional = true }
+
+[features]
+# Allocation-measurement build (ADR 0001 D8.8, ADR 0004): enables the
+# `alloc_probe` runtime module. Gallery binaries chain this from their own
+# `perf-alloc` feature so the counting allocator is a separate build/run.
+perf-alloc = ["dep:dhat"]
 
 [lints]
 workspace = true

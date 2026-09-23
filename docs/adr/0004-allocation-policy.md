@@ -95,3 +95,21 @@ the core of it machine-checked and leaves the edges to trend data.
   budget raises with notes, exactly like size and instruction budgets.
 - The `alloc_probe` proc macro remains future work: two probe sites don't
   yet justify two crates; the hand-proven guard shape is the spec.
+
+## Implementation notes
+
+- 2026-09-22, same day: the `alloc_probe` macro landed — one crate, not
+  two. `crates/alloc-probe` is a dependency-free attribute macro that
+  inserts the hand-proven guard as the function's first statement,
+  cfg-gated on the using crate's `perf-alloc` feature; the runtime
+  (`Probe`, registry, totals) moved to `bw_core::alloc_probe` behind the
+  same feature, next to the existing dhat test binary. Extraction at only
+  two probe sites was a timing call, not a site-count call: the guard
+  shape had stopped changing, and `xtask` needed a stable home for the
+  allocation pass. Probe names and registry keys are unchanged.
+- `cargo xtask perf dhat [--scene <id>]` runs the allocation pass for
+  inspection and archives per-scene callsite reports under
+  `target/perf/dhat/` (both gallery scenes previously clobbered a single
+  `dhat-heap.json`; `perf check`/`measure` preserve per-scene reports
+  now too). The steady-state gate itself is unchanged: `[steady.*]`
+  budgets via `perf check`.

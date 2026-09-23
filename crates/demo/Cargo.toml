@@ -7,18 +7,17 @@ publish.workspace = true
 
 [dependencies]
 bw-core.workspace = true
+alloc-probe.workspace = true # #[alloc_probe] attribute (ADR 0004); compile-time only
 anyhow.workspace = true
 bevy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-dhat = { version = "0.3.3", optional = true }
 
 [features]
 # Allocation pass build (ADR 0003): separate build/run so the tracking
-# allocator never perturbs timing measurements (D8.8). dhat-rs powers it:
-# HeapStats totals for window/per-tick series, Region + Probe guards for
-# per-function attribution.
-perf-alloc = ["dep:dhat"]
+# allocator never perturbs timing measurements (D8.8). The dhat machinery
+# lives in bw-core; probes come from the alloc-probe attribute macro.
+perf-alloc = ["bw-core/perf-alloc"]
 
 [lints]
 workspace = true

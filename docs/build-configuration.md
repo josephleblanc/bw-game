@@ -30,6 +30,11 @@ cargo bench --profile runtime      # criterion benches, once they exist
 # Size measurement and distribution builds
 cargo build --profile size         # artifacts land in target/size/
 cargo xtask perf measure           # records sizes + benches (ADR 0001, D1)
+
+# Allocation inspection (steady-state gate data; callsite reports land in
+# target/perf/dhat/)
+cargo xtask perf dhat              # all gallery scenes
+cargo xtask perf dhat --scene bounce-big --top 10
 ```
 
 Notes:

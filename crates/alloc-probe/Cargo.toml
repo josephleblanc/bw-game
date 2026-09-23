@@ -1,0 +1,12 @@
+[package]
+name = "alloc-probe"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+proc-macro = true
+
+[lints]
+workspace = true

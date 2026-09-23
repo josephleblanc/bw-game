@@ -2,15 +2,30 @@
 //! driven by Bevy ECS over the engine-agnostic `bw_core::sim`, measuring
 //! itself headless per the ADR 0001 D4 contract:
 //!
-//!   bw-demo --perf-headless --scene <id> --ticks <N> --seed <S> --json
+//!   bw-demo --perf-headless --scene <id> --ticks <N> --seed <S>
+//!           [--dhat-out <path>] --json
 //!
 //! Two measurement passes exist (ADR 0001, D8.8): the timing pass (default
 //! build) reports frame-time percentiles; the allocation pass (build with
 //! `--features perf-alloc`, run with `--perf-alloc`) reports windowed and
-//! per-tick allocation series with per-function probe attribution. A
-//! visual/renderer mode arrives with a future gallery ADR.
+//! per-tick allocation series with per-function attribution via
+//! `#[alloc_probe]` (ADR 0004). A visual/renderer mode arrives with a
+//! future gallery ADR.
 
-mod alloc;
+// The attribute macro from the alloc-probe crate; the runtime module is
+// aliased because a plain `use bw_core::alloc_probe` would shadow the
+// extern-crate name in `use` paths under this feature.
+use alloc_probe::alloc_probe;
+
+#[cfg(feature = "perf-alloc")]
+use bw_core::alloc_probe as alloc_probe_rt;
+
+/// Counting allocator for the perf-alloc build. Declared by each
+/// measurement binary — not by bw-core — so the allocator stays a
+/// per-binary decision (see also `tests/steady_alloc.rs` in bw-core).
+#[cfg(feature = "perf-alloc")]
+#[global_allocator]
+static ALLOC: alloc_probe_rt::dhat::Alloc = alloc_probe_rt::dhat::Alloc;
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -42,6 +57,7 @@ struct Args {
     seed: u64,
     json: bool,
     alloc_pass: bool,
+    dhat_out: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -51,6 +67,7 @@ fn parse_args() -> Result<Args, String> {
         seed: DEFAULT_SEED,
         json: false,
         alloc_pass: false,
+        dhat_out: None,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -71,6 +88,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "--json" => args.json = true,
             "--perf-alloc" => args.alloc_pass = true,
+            "--dhat-out" => {
+                let v = iter.next().ok_or("--dhat-out needs a value")?;
+                args.dhat_out = Some(v);
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -81,6 +102,24 @@ fn parse_args() -> Result<Args, String> {
         return Err(format!("unknown scene: {} (try --perf-scenes)", args.scene));
     }
     Ok(args)
+}
+
+/// Profiler output path, scanned from the raw args before parsing so the
+/// profiler can start before parse-time allocations. Flag errors surface
+/// from `parse_args` as usual; a missing flag falls back to the shared
+/// default (per-scene callers pass `--dhat-out` to avoid clobbering it).
+#[cfg(feature = "perf-alloc")]
+fn dhat_out_path() -> String {
+    const DEFAULT: &str = "target/perf/dhat-heap.json";
+    let mut args = std::env::args().skip(1);
+    while let Some(flag) = args.next() {
+        if flag == "--dhat-out"
+            && let Some(value) = args.next()
+        {
+            return value;
+        }
+    }
+    DEFAULT.to_string()
 }
 
 #[derive(Resource)]
@@ -110,9 +149,8 @@ struct Position {
     y: f32,
 }
 
+#[alloc_probe]
 fn step_sim(mut state: ResMut<SimState>, cfg: Res<TickConfig>, mut stats: ResMut<Stats>) {
-    #[cfg(feature = "perf-alloc")]
-    let _probe = alloc::Probe::new("step_sim");
     let SimState { sim, grid, pairs } = &mut *state;
     sim.step(cfg.dt);
     grid.rebuild(&sim.xs, &sim.ys);
@@ -121,9 +159,8 @@ fn step_sim(mut state: ResMut<SimState>, cfg: Res<TickConfig>, mut stats: ResMut
     stats.interactions += pairs.len() as u64;
 }
 
+#[alloc_probe]
 fn sync_positions(state: Res<SimState>, mut query: Query<&mut Position>) {
-    #[cfg(feature = "perf-alloc")]
-    let _probe = alloc::Probe::new("sync_positions");
     // Query iteration order is not guaranteed by Bevy; it does not matter
     // here — each entity is written its own sim value, and the checksum is
     // computed from the sim, not the components.
@@ -232,9 +269,11 @@ struct PerfReport {
 fn main() {
     // First statement so the setup window covers everything after main
     // entry. Pre-main and parse-time allocations are passed through dhat
-    // uncounted.
+    // uncounted. The output path is scanned from the raw args (before
+    // parsing) so per-scene reports don't clobber the shared default; the
+    // same flag is validated again by `parse_args`.
     #[cfg(feature = "perf-alloc")]
-    let _profiler = alloc::init_profiler("target/perf/dhat-heap.json");
+    let _profiler = alloc_probe_rt::init_profiler(&dhat_out_path());
 
     let args = match parse_args() {
         Ok(args) => args,
@@ -242,7 +281,7 @@ fn main() {
             eprintln!("bw-demo: {err}");
             eprintln!(
                 "usage: bw-demo --perf-headless [--scene <id>] [--ticks <n>] [--seed <n>] \
-                 [--json] [--perf-alloc] | --perf-scenes"
+                 [--dhat-out <path>] [--json] [--perf-alloc] | --perf-scenes"
             );
             std::process::exit(2);
         }
@@ -279,18 +318,18 @@ fn main() {
 
     // Setup window ends here: everything above is one-off scene cost.
     #[cfg(feature = "perf-alloc")]
-    let setup_totals = alloc::totals();
+    let setup_totals = alloc_probe_rt::totals();
 
     // Warmup: allocator, scheduler, and caches settle before timing starts.
     for _ in 0..WARMUP_TICKS {
         app.update();
     }
     #[cfg(feature = "perf-alloc")]
-    let warmup_totals = alloc::totals();
+    let warmup_totals = alloc_probe_rt::totals();
     #[cfg(feature = "perf-alloc")]
-    let probes_before_window = alloc::registry_snapshot();
+    let probes_before_window = alloc_probe_rt::registry_snapshot();
     #[cfg(feature = "perf-alloc")]
-    let live_start = alloc::live_bytes();
+    let live_start = alloc_probe_rt::live_bytes();
 
     #[cfg(feature = "perf-alloc")]
     let mut tick_blocks: Vec<f64> = Vec::with_capacity(args.ticks as usize);
@@ -299,13 +338,13 @@ fn main() {
     let mut frame_ms = Vec::with_capacity(args.ticks as usize);
     for _ in 0..args.ticks {
         #[cfg(feature = "perf-alloc")]
-        let before = alloc::totals();
+        let before = alloc_probe_rt::totals();
         let start = Instant::now();
         app.update();
         let elapsed = start.elapsed();
         #[cfg(feature = "perf-alloc")]
         {
-            let after = alloc::totals();
+            let after = alloc_probe_rt::totals();
             tick_blocks.push((after.0 - before.0) as f64);
             tick_bytes.push((after.1 - before.1) as f64);
         }
@@ -313,11 +352,11 @@ fn main() {
     }
 
     #[cfg(feature = "perf-alloc")]
-    let measured_totals = alloc::totals();
+    let measured_totals = alloc_probe_rt::totals();
     #[cfg(feature = "perf-alloc")]
-    let live_end = alloc::live_bytes();
+    let live_end = alloc_probe_rt::live_bytes();
     #[cfg(feature = "perf-alloc")]
-    let probes_final = alloc::registry_snapshot();
+    let probes_final = alloc_probe_rt::registry_snapshot();
 
     let stats = app.world().resource::<Stats>();
     let sim = &app.world().resource::<SimState>().sim;
@@ -337,10 +376,10 @@ fn main() {
     if args.alloc_pass {
         #[cfg(feature = "perf-alloc")]
         {
-            let (total_blocks, _) = alloc::totals();
+            let (total_blocks, _) = alloc_probe_rt::totals();
             report.allocs = Some(AllocStats {
                 count: total_blocks,
-                peak_bytes: alloc::peak_bytes(),
+                peak_bytes: alloc_probe_rt::peak_bytes(),
             });
             report.alloc_detail = Some(alloc_detail(
                 &probes_before_window,
@@ -381,8 +420,8 @@ fn main() {
 #[cfg(feature = "perf-alloc")]
 #[allow(clippy::too_many_arguments)]
 fn alloc_detail(
-    probes_before_window: &alloc::Registry,
-    probes_final: &alloc::Registry,
+    probes_before_window: &alloc_probe_rt::Registry,
+    probes_final: &alloc_probe_rt::Registry,
     setup_totals: (u64, u64),
     warmup_totals: (u64, u64),
     measured_totals: (u64, u64),
@@ -393,8 +432,8 @@ fn alloc_detail(
     ticks: u64,
 ) -> AllocDetail {
     fn probe_map(
-        source: &alloc::Registry,
-        calls: &alloc::Registry,
+        source: &alloc_probe_rt::Registry,
+        calls: &alloc_probe_rt::Registry,
     ) -> std::collections::BTreeMap<String, ProbeTotals> {
         let mut map = std::collections::BTreeMap::new();
         // `calls` carries the per-name call counts (identical in both
@@ -418,7 +457,7 @@ fn alloc_detail(
 
     // Window-only probe attribution = final snapshot - pre-window snapshot.
     let measured_probes_map = {
-        let mut window = alloc::Registry::new();
+        let mut window = alloc_probe_rt::Registry::new();
         for (name, (fb, fby, fc)) in probes_final {
             let before = probes_before_window.get(name).copied().unwrap_or((0, 0, 0));
             window.insert(
