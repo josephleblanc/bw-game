@@ -53,12 +53,15 @@ fn expand(item: TokenStream) -> TokenStream {
     // The first brace group after `fn` is the body. Signature types, where
     // clauses, and attributes use parens/angles/brackets, never braces
     // (no const generics — see the crate docs).
-    let Some(body_at) = tokens.iter().enumerate().skip(fn_at + 1).find_map(|(i, tt)| {
-        match tt {
+    let Some(body_at) = tokens
+        .iter()
+        .enumerate()
+        .skip(fn_at + 1)
+        .find_map(|(i, tt)| match tt {
             TokenTree::Group(g) if g.delimiter() == Delimiter::Brace => Some(i),
             _ => None,
-        }
-    }) else {
+        })
+    else {
         return compile_error("#[alloc_probe]: function has no body to probe");
     };
     let TokenTree::Group(body) = &tokens[body_at] else {

@@ -308,3 +308,14 @@ per scene; the `alloc_probe` macro landed with it. The remaining Phase 3
 items — `perf-trend.yml`, the `perf-data` branch, `release.yml`, CI
 wiring, the review ritual — all presuppose a hosted remote; until one
 exists, `cargo xtask perf check` remains the CI.
+
+Remote landed later the same day (`josephleblanc/bw-game`, private):
+`ci.yml` (fmt/clippy/tests/wasm + measure/check), `perf-trend.yml`
+(weekly + manual; appends records to the seeded `perf-data` orphan
+branch, posts the rendered report to the rolling `perf-review` issue via
+the new `cargo xtask perf report`), `release.yml` (budget-green gate +
+perf manifest), and `docs/perf-review.md` (the D9 ritual). Branch
+protection — required status checks — is not available for private
+repos on a free plan; until the repo goes public or the account upgrades,
+the required-check half of D7 is unwired: CI fails loudly, but nothing
+mechanically blocks a red merge.

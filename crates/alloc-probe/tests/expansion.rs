@@ -21,8 +21,8 @@ fn plain(x: u32) -> u32 {
 pub fn decorated(items: &[u32]) -> u32 {
     // Braces nested inside the body (closures, blocks) must not confuse
     // the body search: the first brace group after `fn` is the body.
-    let double = |v: u32| { v * 2 };
-    items.iter().map(|&v| { double(v) }).sum()
+    let double = |v: u32| v * 2;
+    items.iter().map(|&v| double(v)).sum()
 }
 
 struct Fixture;
