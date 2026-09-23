@@ -16,6 +16,22 @@ serde_json.workspace = true
 # allocator never perturbs timing measurements (D8.8). Same feature wiring
 # as bw-demo; the report types come from bw_core::gallery.
 perf-alloc = ["bw-core/perf-alloc"]
+# tree-playground: the live windowed viewer (backlog.md). Dev-only and
+# opt-in — turns on bevy's windowing/render/sprite/text stack so the
+# default dependency graph, wasm gate, and size budgets stay untouched
+# (ADR 0002). The first `--features viewer` build compiles wgpu; expect a
+# one-time longer compile.
+viewer = [
+  "bevy/bevy_winit",
+  "bevy/x11",
+  "bevy/wayland",
+  "bevy/bevy_render",
+  "bevy/bevy_sprite_render",
+  "bevy/bevy_text",
+  "bevy/default_font",
+  # PNG encode: the --viewer-shot smoke saves screenshots to disk.
+  "bevy/png",
+]
 
 [lints]
 workspace = true

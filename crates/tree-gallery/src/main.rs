@@ -12,11 +12,12 @@
 //! Simulation lives in `bw_core::tree` (engine-agnostic, allocate-once);
 //! this binary owns the Bevy ECS glue: a `step_trees` system advancing the
 //! clock and posing every tree, and a `sync_segments` system materializing
-//! per-segment components for the renderer-to-be. The visual surface today
-//! is `--render <file>` / `--render-frame <file>`: a self-contained
-//! animated SVG in the tactical-camera projection (see `proj` and `svg`)
-//! — the real renderer stays deferred per ADR 0002, so no Bevy render
-//! features are enabled for this.
+//! per-segment components for the renderer-to-be. The default visual
+//! surface is `--render <file>` / `--render-frame <file>`: a
+//! self-contained animated SVG in the tactical-camera projection (see
+//! `proj` and `svg`) — the default build enables no Bevy render features
+//! (ADR 0002). The live windowed playground (`--viewer`, `viewer` module)
+//! exists only behind the dev-only `viewer` cargo feature.
 
 use alloc_probe::alloc_probe;
 
@@ -44,6 +45,11 @@ use bw_core::tree::{CALM_WIND, Tree, TreeParams, TreePose, WindParams};
 
 mod proj;
 mod svg;
+// tree-playground: the live windowed viewer exists only behind the
+// dev-only `viewer` cargo feature (bevy windowing/render are otherwise
+// deferred per ADR 0002).
+#[cfg(feature = "viewer")]
+mod viewer;
 
 const DEFAULT_TICKS: u64 = 600;
 const DEFAULT_SEED: u64 = 42;
@@ -125,6 +131,13 @@ struct BuiltScene {
     growth_end: f32,
 }
 
+/// Deterministic per-anchor seed: anchor `k` of a scene seeded with `seed`
+/// always sees the same tree. Shared by the headless builder and the
+/// viewer so both grow the same grove from `(scene, seed)`.
+fn tree_seed(seed: u64, k: usize) -> u64 {
+    seed.wrapping_add((k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
 fn build_scene(preset: &ScenePreset, seed: u64) -> BuiltScene {
     let mut trees = Vec::with_capacity(preset.anchors.len());
     let mut poses = Vec::with_capacity(preset.anchors.len());
@@ -133,11 +146,11 @@ fn build_scene(preset: &ScenePreset, seed: u64) -> BuiltScene {
     let mut leaves = 0;
     let mut growth_end = 0.0f32;
     for (k, &(ti, tj)) in preset.anchors.iter().enumerate() {
-        let tree_seed = seed.wrapping_add((k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let seed_k = tree_seed(seed, k);
         // Trees live in their own local plane (base 0,0): the ground anchor
         // enters only through the billboard projection at render time, so
         // ECS segments stay tree-plane local.
-        let tree = Tree::generate(&preset.params, tree_seed);
+        let tree = Tree::generate(&preset.params, seed_k);
         segments += tree.node_count();
         leaves += tree.leaf_count();
         growth_end = growth_end.max(tree.growth_end());
@@ -164,6 +177,10 @@ struct Args {
     dhat_out: Option<String>,
     render: Option<String>,
     render_frame: Option<String>,
+    viewer: bool,
+    /// Dev smoke: with `--viewer`, capture two screenshots and exit.
+    #[cfg_attr(not(feature = "viewer"), allow(dead_code))]
+    viewer_shot: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -176,6 +193,8 @@ fn parse_args() -> Result<Args, String> {
         dhat_out: None,
         render: None,
         render_frame: None,
+        viewer: false,
+        viewer_shot: None,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -207,6 +226,11 @@ fn parse_args() -> Result<Args, String> {
             "--render-frame" => {
                 let v = iter.next().ok_or("--render-frame needs a value")?;
                 args.render_frame = Some(v);
+            }
+            "--viewer" => args.viewer = true,
+            "--viewer-shot" => {
+                let v = iter.next().ok_or("--viewer-shot needs a value")?;
+                args.viewer_shot = Some(v);
             }
             other => return Err(format!("unknown argument: {other}")),
         }
@@ -303,7 +327,8 @@ fn main() {
             eprintln!(
                 "usage: bw-tree-gallery --perf-headless [--scene <id>] [--ticks <n>] \
                  [--seed <n>] [--dhat-out <path>] [--json] [--perf-alloc] | --perf-scenes\n\
-                 \x20        visual output: --render <anim.svg> --render-frame <static.svg>"
+                 \x20        visual output: --render <anim.svg> --render-frame <static.svg>\n\
+                 \x20        live window (dev build): --viewer"
             );
             std::process::exit(2);
         }
@@ -313,6 +338,19 @@ fn main() {
         eprintln!("bw-tree-gallery: unknown scene {}", args.scene);
         std::process::exit(2);
     };
+
+    // Live windowed playground: hand off to the viewer (feature-gated; the
+    // default build has no windowing and answers with a build hint).
+    #[cfg(feature = "viewer")]
+    if args.viewer {
+        viewer::run(&preset, &args.scene, args.seed, args.viewer_shot.as_deref());
+        return;
+    }
+    #[cfg(not(feature = "viewer"))]
+    if args.viewer {
+        eprintln!("bw-tree-gallery: --viewer needs a build with --features viewer (dev-only)");
+        std::process::exit(2);
+    }
 
     // Visual output path: render and exit; it is not a measurement pass.
     if args.render.is_some() || args.render_frame.is_some() {

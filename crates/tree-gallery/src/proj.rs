@@ -37,6 +37,15 @@ pub fn tile_center(i: i32, j: i32) -> (f32, f32) {
     ((i as f32 + 0.5) * TILE, (j as f32 + 0.5) * TILE)
 }
 
+/// Half-diagonals of one tile's projected diamond (screen units): the
+/// exact screen shape a rendered tile must cover. The diamond is a
+/// sheared square, so only a mesh can draw it exactly — sprites handle
+/// everything else in this projection. (Consumed by the `viewer` build.)
+#[cfg_attr(not(feature = "viewer"), allow(dead_code))]
+pub fn tile_diamond() -> (f32, f32) {
+    (TILE * COS_YAW, TILE * COS_YAW * SIN_PITCH)
+}
+
 /// Project a ground-plane point (world x, z) to screen space. Screen y
 /// grows downward; +z runs toward the viewer (down-right on screen).
 pub fn project_ground(gx: f32, gz: f32) -> (f32, f32) {
@@ -89,6 +98,25 @@ mod tests {
         let side = TILE * std::f32::consts::FRAC_1_SQRT_2;
         assert!((width - 2.0 * side).abs() < 1e-3);
         assert!((height - 2.0 * side * SIN_PITCH).abs() < 1e-3);
+    }
+
+    /// The tile-diamond helper matches the projected tile corners exactly.
+    #[test]
+    fn tile_diamond_matches_projected_corners() {
+        let (a, b) = tile_diamond();
+        let (cx, cy) = project_ground(TILE * 0.5, TILE * 0.5);
+        let corners = [
+            project_ground(0.0, 0.0),
+            project_ground(TILE, 0.0),
+            project_ground(TILE, TILE),
+            project_ground(0.0, TILE),
+        ];
+        for (x, y) in corners {
+            assert!((x - cx).abs() <= a + 1e-3 && (y - cy).abs() <= b + 1e-3);
+        }
+        // The extreme corners sit exactly on the diagonal tips.
+        assert!((corners[1].0 - (cx + a)).abs() < 1e-3);
+        assert!((corners[2].1 - (cy + b)).abs() < 1e-3);
     }
 
     /// Billboards stand fully upright: height maps 1:1 to screen height,

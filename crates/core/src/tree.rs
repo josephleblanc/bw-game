@@ -59,6 +59,10 @@ pub struct TreeParams {
     pub leader_jitter: f32,
     /// Side-branch length ratio per level: `1/φ` for the golden scheme.
     pub side_ratio: f32,
+    /// Angular offset of a side branch from its parent direction
+    /// (radians). `FORK_SPREAD` for the golden scheme; the live viewer
+    /// nudges this while tuning.
+    pub spread: f32,
     /// Multiplier jitter on every ratio draw (± fraction, ~0.15).
     pub ratio_jitter: f32,
     /// Multiplier jitter on the fork angle (~0.15).
@@ -82,6 +86,7 @@ impl TreeParams {
             leader_ratio: 0.82,
             leader_jitter: 0.06,
             side_ratio: 1.0 / GOLDEN_RATIO,
+            spread: FORK_SPREAD,
             ratio_jitter: 0.15,
             angle_jitter: 0.15,
             extra_prob: 0.28,
@@ -382,7 +387,7 @@ impl Tree {
             * rng.range_f32(1.0 - params.ratio_jitter, 1.0 + params.ratio_jitter);
         if side_len >= params.min_len {
             let offset = side_sign
-                * FORK_SPREAD
+                * params.spread
                 * rng.range_f32(1.0 - params.angle_jitter, 1.0 + params.angle_jitter);
             let side = self.push_node(
                 node as u32,
@@ -403,7 +408,7 @@ impl Tree {
             let extra_len = self.len[node] * params.side_ratio / GOLDEN_RATIO
                 * rng.range_f32(1.0 - params.ratio_jitter, 1.0 + params.ratio_jitter);
             if extra_len >= params.min_len {
-                let offset = -side_sign * FORK_SPREAD / GOLDEN_RATIO
+                let offset = -side_sign * params.spread / GOLDEN_RATIO
                     * rng.range_f32(1.0 - params.angle_jitter, 1.0 + params.angle_jitter);
                 let extra = self.push_node(
                     node as u32,
@@ -489,6 +494,14 @@ fn growth_factor(age: f32, dur: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oak_uses_the_golden_spread_by_default() {
+        // The oak preset must keep the golden-scheme spread exactly: this
+        // pins generation (and thus every gallery checksum) against
+        // accidental retuning while the field is exposed to the viewer.
+        assert_eq!(TreeParams::oak().spread, FORK_SPREAD);
+    }
 
     #[test]
     fn generation_is_deterministic() {
