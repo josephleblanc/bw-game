@@ -177,11 +177,14 @@ handful of wanderers standing on walkable tiles (viewer-only;
 headless map output is bw-map-gallery's).
 
 - **Click-to-send routes through A***: the ground click converts to a
-  tile, one pathfinding query runs in `Update`, and the figure walks
-  the tile route (`FollowPath`). Faint red dots mark the remaining
-  waypoints and expire as the figure passes them; the red disc marks
-  the destination and clears on arrival. Clicking water refuses —
-  no route, no marker.
+  tile, one pathfinding query runs in `Update`, and the route is
+  string-pulled smooth (`bw_core::path::smooth_route` — stair-stepped
+  diagonals walk as one straight leg, grid-faithful). The figure walks
+  it via `FollowPath`, carving corners in stride (cruise scaled by
+  alignment; only reversals pivot in place). Faint red dots mark the
+  remaining waypoints and expire as the figure passes them; the red
+  disc marks the destination and clears on arrival. Clicking water
+  refuses — no route, no marker.
 - **Wanderers** re-route themselves to nearby walkable tiles every
   few seconds (routes bend around ponds; the player is never
   auto-sent).

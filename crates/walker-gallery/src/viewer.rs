@@ -59,7 +59,7 @@ use bevy::window::{PrimaryWindow, WindowResolution};
 use bw_core::character::{Carry, Character, MovementInput, Skeleton, bone};
 use bw_core::map::{Map, Tile, tile_center, tile_of};
 use bw_core::math::Vec3 as BwVec3;
-use bw_core::path::Pathfinder;
+use bw_core::path::{Pathfinder, smooth_route};
 use bw_core::sim::Rng;
 use bw_core::time::SIM_DT;
 
@@ -251,6 +251,9 @@ struct MapScene {
     map: Map,
     pathfinder: Pathfinder,
     scratch: Vec<Tile>,
+    /// The smoothed route buffer, reused per send (the A* result lands
+    /// in `scratch`, the string-pulled walk in here).
+    smooth: Vec<Tile>,
     /// The free camera's focus (map mode does not follow the
     /// selection — pan owns the frame, colony-sim style).
     focus: BwVec3,
@@ -425,6 +428,7 @@ pub fn run(scene_id: &str, seed: u64, shot: Option<&str>) {
                     pathfinder: Pathfinder::new(&map),
                     map,
                     scratch: Vec::new(),
+                    smooth: Vec::new(),
                     focus: BwVec3::new(w * 0.5, 0.0, h * 0.5),
                     rng: Rng::new(seed ^ 0x5EED),
                     resend: 0.0,
@@ -1081,9 +1085,12 @@ fn clamp_focus(focus: BwVec3, map: &Map) -> BwVec3 {
 }
 
 /// Plan a routed send: ground point → goal tile, one A* query from
-/// the figure's tile. `None` when either end is unwalkable or no
-/// route connects (water clicks refuse). Event-driven by design —
-/// this runs in `Update` on click, never per tick.
+/// the figure's tile, then the string-pull smooth — stair-stepped
+/// diagonals become straight legs, so the walk never halt-pivots its
+/// way across open ground (the fluency law, docs/animation/qualities.md).
+/// `None` when either end is unwalkable or no route connects (water
+/// clicks refuse). Event-driven by design — this runs in `Update` on
+/// click, never per tick.
 fn plan_route(map_scene: &mut MapScene, from_pos: BwVec3, to_point: BwVec3) -> Option<Vec<Tile>> {
     let to = tile_of(to_point);
     let from = tile_of(from_pos);
@@ -1094,7 +1101,8 @@ fn plan_route(map_scene: &mut MapScene, from_pos: BwVec3, to_point: BwVec3) -> O
         .pathfinder
         .find_path_into(&map_scene.map, from, to, &mut map_scene.scratch)
     {
-        Some(map_scene.scratch.clone())
+        smooth_route(&map_scene.map, &map_scene.scratch, &mut map_scene.smooth);
+        Some(map_scene.smooth.clone())
     } else {
         None
     }
@@ -1739,6 +1747,7 @@ fn shot_variant(path: &str, tag: &str) -> String {
 mod tests {
     use super::*;
     use crate::scene_preset;
+    use bw_core::path::line_of_sight;
 
     #[test]
     fn key_action_maps_the_playground_keys() {
@@ -1921,7 +1930,8 @@ mod tests {
     }
 
     /// Routed sends plan like clicks: walkable targets connect through
-    /// A*, water clicks refuse, and the focus stays inside the map.
+    /// A* **smoothed** (stair-collapsed, line-of-sight legs), water
+    /// clicks refuse, and the focus stays inside the map.
     #[test]
     fn plan_route_routes_walkable_and_refuses_water() {
         let map = Map::generate(42, bw_core::map::GenParams::default());
@@ -1929,11 +1939,13 @@ mod tests {
             pathfinder: Pathfinder::new(&map),
             map,
             scratch: Vec::new(),
+            smooth: Vec::new(),
             focus: BwVec3::new(32.0, 0.0, 32.0),
             rng: Rng::new(1),
             resend: 0.0,
         };
-        // A walkable target: the route is 4-adjacent, start-inclusive.
+        // A walkable target: endpoints kept and every smoothed leg has
+        // line of sight (not 4-adjacent — the string-pull cuts stairs).
         let start = tile_center(Tile { x: 4, z: 4 });
         let Some(route) = plan_route(&mut map_scene, start, tile_center(Tile { x: 10, z: 4 }))
         else {
@@ -1942,9 +1954,37 @@ mod tests {
         assert_eq!(route.first(), Some(&Tile { x: 4, z: 4 }));
         assert_eq!(route.last(), Some(&Tile { x: 10, z: 4 }));
         for pair in route.windows(2) {
-            let d = (pair[0].x - pair[1].x).abs() + (pair[0].z - pair[1].z).abs();
-            assert_eq!(d, 1);
+            assert!(
+                line_of_sight(&map_scene.map, pair[0], pair[1]),
+                "smoothed leg {:?} -> {:?} lost line of sight",
+                pair[0],
+                pair[1]
+            );
         }
+        // On open ground the smooth collapses everything: a blank map's
+        // diagonal is exactly two waypoints, start and goal.
+        let blank_scene = |map: Map| MapScene {
+            pathfinder: Pathfinder::new(&map),
+            map,
+            scratch: Vec::new(),
+            smooth: Vec::new(),
+            focus: BwVec3::new(8.0, 0.0, 8.0),
+            rng: Rng::new(1),
+            resend: 0.0,
+        };
+        let mut blank = blank_scene(Map::blank(16, 16));
+        let Some(route) = plan_route(
+            &mut blank,
+            tile_center(Tile { x: 2, z: 2 }),
+            tile_center(Tile { x: 10, z: 10 }),
+        ) else {
+            panic!("blank-map diagonals must route");
+        };
+        assert_eq!(
+            route,
+            vec![Tile { x: 2, z: 2 }, Tile { x: 10, z: 10 }],
+            "an open diagonal must send as one straight leg"
+        );
         // A water click refuses (find a water tile on the meadow).
         let water = (0..map_scene.map.height() as i32)
             .flat_map(|z| (0..map_scene.map.width() as i32).map(move |x| Tile { x, z }))

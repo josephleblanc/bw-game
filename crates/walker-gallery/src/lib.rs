@@ -119,12 +119,13 @@ pub struct CirclePath {
 }
 
 /// Scripted controller: walk to a point on the ground, then hold. The
-/// figure turns toward the bearing first (halting to turn in place
-/// when it is more than a quarter-turn off), walks at
-/// [`MOVE_TO_SPEED`], and stops inside the arrival radius. An arrived
-/// target stays as an inert component instead of being removed: the
-/// fixed-step systems take no `Commands`, so the tick stays
-/// allocation-free (ADR 0004) and controllers can only write input.
+/// figure turns toward the bearing while walking — cruise scaled by
+/// alignment, planting to pivot only past a quarter-turn (the shared
+/// law, [`steer_toward`]) — and stops inside the arrival radius. An
+/// arrived target stays as an inert component instead of being
+/// removed: the fixed-step systems take no `Commands`, so the tick
+/// stays allocation-free (ADR 0004) and controllers can only write
+/// input.
 #[derive(Component)]
 pub struct MoveTarget {
     /// Goal on the ground plane.
@@ -226,11 +227,17 @@ fn step_circle_paths(mut query: Query<(&CirclePath, &mut Walker)>) {
 }
 
 /// The steering law point-to-point controllers share: turn toward the
-/// bearing (halting to pivot in place when more than a quarter-turn
-/// off), then walk at cruise speed. The bearing uses the character's
-/// own heading convention (+z at 0, `atan2(x, z)`), with the error
-/// wrapped to `−π..π` because heading is unbounded. Arrival is the
-/// caller's business.
+/// bearing and walk at cruise **scaled by alignment** — a misaligned
+/// figure's forward progress is `cos(bearing error)` of cruise, so
+/// corners are carved in stride (slow into the bend, accelerating out)
+/// and the law is continuous at the quarter-turn, where cos reaches
+/// zero. Beyond a quarter-turn (reversals) the speed command is a hard
+/// zero and the figure plants and pivots — no orbiting. The bearing
+/// uses the character's own heading convention (+z at 0, `atan2(x, z)`),
+/// with the error wrapped to `−π..π` because heading is unbounded.
+/// Arrival is the caller's business. (Turns-in-stride is the agility
+/// half of the stair-shuffle fix; send-time route smoothing is the
+/// other half — `bw_core::path::smooth_route`.)
 fn steer_toward(character: &Character, to: Vec3) -> MovementInput {
     let bearing = to.x.atan2(to.z);
     let err = (bearing - character.heading + std::f32::consts::PI)
@@ -240,7 +247,7 @@ fn steer_toward(character: &Character, to: Vec3) -> MovementInput {
         target_speed: if err.abs() > MOVE_TURN_HALT {
             0.0
         } else {
-            MOVE_TO_SPEED
+            MOVE_TO_SPEED * err.cos().max(0.0)
         },
         turn_rate: (err * MOVE_TURN_GAIN).clamp(-MOVE_TURN, MOVE_TURN),
         jump: false,
@@ -582,6 +589,166 @@ mod tests {
         );
         assert_eq!(w.character.speed, 0.0);
         assert_eq!(w.input, MovementInput::default());
+    }
+
+    /// The turns-in-stride law, unit-pinned: inside a quarter-turn the
+    /// speed command is cruise·cos(bearing error) — continuous, since
+    /// cos reaches exactly zero at the quarter-turn — and beyond it the
+    /// pivot commands zero speed with full turn authority.
+    #[test]
+    fn steer_toward_scales_speed_with_alignment() {
+        let facing = |heading: f32| Character::new(Vec3::ZERO, heading);
+        // Dead ahead: full cruise, no turn.
+        let i = steer_toward(&facing(0.0), Vec3::new(0.0, 0.0, 3.0));
+        assert_eq!(i.target_speed, MOVE_TO_SPEED);
+        assert_eq!(i.turn_rate, 0.0);
+        // Half a right angle off: cruise·cos(45°).
+        let i = steer_toward(&facing(0.0), Vec3::new(3.0, 0.0, 3.0));
+        assert!(
+            (i.target_speed - MOVE_TO_SPEED * std::f32::consts::FRAC_PI_4.cos()).abs() < 1e-5,
+            "45° off must command cos-scaled cruise: {}",
+            i.target_speed
+        );
+        // A quarter-turn off: the carve is continuous into the pivot —
+        // the command is zero for all practical purposes (the wrap's
+        // float rounding may leave a hair under π/2, worth ~1e-8 m/s) —
+        // with saturated turn authority.
+        let i = steer_toward(&facing(0.0), Vec3::new(3.0, 0.0, 0.0));
+        assert!(
+            i.target_speed < 1e-6,
+            "quarter-turn commands ~zero: {}",
+            i.target_speed
+        );
+        assert!((i.turn_rate.abs() - MOVE_TURN).abs() < 1e-5);
+        // Behind: a hard pivot — zero speed, turn still commanded.
+        let i = steer_toward(&facing(0.0), Vec3::new(0.0, 0.0, -3.0));
+        assert_eq!(i.target_speed, 0.0);
+        assert!((i.turn_rate.abs() - MOVE_TURN).abs() < 1e-5);
+    }
+
+    /// The stair shuffle is dead, end to end: a raw stair-stepped
+    /// diagonal route (exactly what 4-neighborhood A* hands back, no
+    /// send-time smoothing) walks without one full halt after the
+    /// initial pivot — the figure carves each bend in stride — and
+    /// still ends standing at the final tile.
+    #[test]
+    fn stair_route_walks_without_halting() {
+        let mut app = App::new();
+        app.add_plugins(CharacterMovementPlugin)
+            .insert_resource(WalkerSkeleton(Skeleton::humanoid()));
+        let skel = app.world().resource::<WalkerSkeleton>().0.clone();
+        let stair: Vec<Tile> = [
+            (2, 2),
+            (3, 2),
+            (3, 3),
+            (4, 3),
+            (4, 4),
+            (5, 4),
+            (5, 5),
+            (6, 5),
+            (6, 6),
+        ]
+        .iter()
+        .map(|&(x, z)| Tile { x, z })
+        .collect();
+        let walker = spawn_walker(
+            app.world_mut(),
+            &skel,
+            Character::new(tile_center(stair[0]), 0.0),
+            MovementInput::default(),
+        );
+        app.world_mut()
+            .entity_mut(walker)
+            .insert(FollowPath::new(stair));
+        let mut min_speed = f32::INFINITY;
+        for tick in 0..600 {
+            let _ = app.world_mut().try_run_schedule(FixedUpdate);
+            app.update();
+            let (Some(w), Some(fp)) = (
+                app.world().get::<Walker>(walker),
+                app.world().get::<FollowPath>(walker),
+            ) else {
+                panic!("walker and route must stay alive");
+            };
+            if fp.is_finished() {
+                break;
+            }
+            // Skip the initial pivot onto the route (a standing start
+            // may legitimately plant and turn) — the law under test is
+            // what happens mid-route.
+            if tick > 60 {
+                min_speed = min_speed.min(w.character.speed);
+            }
+        }
+        let Some(w) = app.world().get::<Walker>(walker) else {
+            panic!("walker must stay alive");
+        };
+        let end = tile_center(Tile { x: 6, z: 6 });
+        let dist =
+            ((w.character.pos.x - end.x).powi(2) + (w.character.pos.z - end.z).powi(2)).sqrt();
+        assert!(dist < 0.35, "should stand at the route's end: dist {dist}");
+        assert!(
+            min_speed > 0.15,
+            "a stair route must never fully halt mid-walk (min speed {min_speed})"
+        );
+    }
+
+    /// The smoothing payoff, pinned: a string-pulled diagonal (the
+    /// send-time smooth's output on open ground) walks a near-straight
+    /// line — small lateral deviation from the center-to-center line,
+    /// no halts, arrival at the far tile.
+    #[test]
+    fn smoothed_diagonal_route_stays_on_the_line() {
+        let mut app = App::new();
+        app.add_plugins(CharacterMovementPlugin)
+            .insert_resource(WalkerSkeleton(Skeleton::humanoid()));
+        let skel = app.world().resource::<WalkerSkeleton>().0.clone();
+        let route = vec![Tile { x: 2, z: 2 }, Tile { x: 5, z: 5 }];
+        let walker = spawn_walker(
+            app.world_mut(),
+            &skel,
+            Character::new(tile_center(route[0]), 0.0),
+            MovementInput::default(),
+        );
+        app.world_mut()
+            .entity_mut(walker)
+            .insert(FollowPath::new(route));
+        let mut worst = 0.0f32;
+        let mut min_speed = f32::INFINITY;
+        for tick in 0..600 {
+            let _ = app.world_mut().try_run_schedule(FixedUpdate);
+            app.update();
+            let (Some(w), Some(fp)) = (
+                app.world().get::<Walker>(walker),
+                app.world().get::<FollowPath>(walker),
+            ) else {
+                panic!("walker and route must stay alive");
+            };
+            if fp.is_finished() {
+                break;
+            }
+            if tick > 60 {
+                let p = w.character.pos;
+                let lateral = ((p.x - 2.5) - (p.z - 2.5)).abs() / std::f32::consts::SQRT_2;
+                worst = worst.max(lateral);
+                min_speed = min_speed.min(w.character.speed);
+            }
+        }
+        let Some(w) = app.world().get::<Walker>(walker) else {
+            panic!("walker must stay alive");
+        };
+        let end = tile_center(Tile { x: 5, z: 5 });
+        let dist =
+            ((w.character.pos.x - end.x).powi(2) + (w.character.pos.z - end.z).powi(2)).sqrt();
+        assert!(dist < 0.35, "should stand at the far tile: dist {dist}");
+        assert!(
+            worst < 0.45,
+            "smoothed diagonal must stay near the line: worst {worst}"
+        );
+        assert!(
+            min_speed > 0.15,
+            "the diagonal must never halt mid-walk (min speed {min_speed})"
+        );
     }
 
     /// Routed control: an L-shaped tile route walks waypoint by

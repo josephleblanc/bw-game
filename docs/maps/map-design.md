@@ -142,15 +142,29 @@ Allocation contract, in the ADR 0004 spirit:
 - Results land in a caller-owned reused `&mut Vec<Tile>` (the
   `CharacterPose` pattern: the buffer is the API).
 
+**Send-time smoothing** (`smooth_route` + `line_of_sight`): the raw
+4-neighborhood route is string-pulled at send time — keep exactly the
+waypoints needed so consecutive kept ones have walkable line of sight,
+so stair-stepped diagonals collapse into straight legs. The sight
+check is a conservative supercover: an exact lattice-corner crossing
+counts **both** flanking tiles, and the crossing order is decided by
+integer cross-multiplied comparison, so the perfect diagonal's corner
+touches can never be missed to float rounding. The output is always a
+subsequence of the A* route (start and goal kept) — walks stay
+grid-faithful, only ever aiming at tiles A* chose. Send-time by
+design: `Update` on click, never per tick (the fluency half of the
+stair-shuffle fix, docs/animation/qualities.md "Path fluency").
+
 ## Walker integration
 
 - **`FollowPath`** — a plugin-side controller next to `CirclePath` and
   `MoveTarget`, owning the remaining tile list and writing input per
   tick (input-only, no `Commands` in `FixedUpdate` — the established
   law). It advances a waypoint when the walker is inside the arrival
-  radius, steering with `MoveTarget`'s turn-first logic; the final
-  waypoint aims at the tile center. Cancelling is a component removal
-  in `Update`, exactly like `MoveTarget` today.
+  radius, steering with the shared turn law (turns-in-stride: cruise
+  scaled by alignment, a planted pivot only past a quarter-turn); the
+  final waypoint aims at the tile center. Cancelling is a component
+  removal in `Update`, exactly like `MoveTarget` today.
 - **Send becomes routed**: the viewer's ground click converts to a
   tile, runs one A\* query (event-driven, in `Update`), and spawns the
   `FollowPath`. Straight-line `MoveTarget` remains as the primitive

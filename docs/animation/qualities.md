@@ -78,6 +78,12 @@ any-angle routing (currently 4-neighborhood only).
   not free striding — FFT is tile-locked and never shuffles because turns
   happen in stride during the walk. The likely fix family is turns-in-
   stride plus corner tolerance, not abandoning tile routes.
+- **Decision (2026-09-23): fixed, grid-faithful.** Send-time string-pull
+  smoothing (`bw_core::path::smooth_route`) collapses stair-stepped
+  diagonals into straight legs — the smoothed route is a subsequence of
+  the A* route over conservative line of sight, so the walk only ever
+  aims at tiles A* chose (the FFT property). Blank-map stairs collapse
+  to `[start, goal]`; bends a wall forces survive as corners.
 
 ### 2. Agility — sprite agility
 
@@ -96,6 +102,12 @@ instant, which makes every stop stark), first-response latency.
 - Note: Shadow of the Colossus as a *counter* is informative — deliberate
   input lag as an aesthetic is explicitly rejected for colony command
   feel.
+- **Decision (2026-09-23): turns-in-stride landed.** `steer_toward`'s
+  speed command is cruise·cos(bearing error) inside the quarter-turn,
+  continuous into the pivot (cos reaches zero at 90°) — corners are
+  carved, slow in and accelerating out; only reversals plant and pivot.
+  A raw stair route now walks with zero mid-route halts (pinned: min
+  speed > 0.15 m/s after the initial pivot).
 
 ### 3. Weight — the impression of mass
 

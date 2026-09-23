@@ -177,6 +177,94 @@ impl Pathfinder {
     }
 }
 
+/// Line of sight between two tile centers, conservative by law: every
+/// tile the segment touches must be walkable, and an exact lattice-corner
+/// crossing counts **both** flanking tiles, so a smoothed leg never
+/// clips a blocked corner. The crossing order is decided by
+/// cross-multiplied integer comparison (t_x ∝ (2k+1)/2·|dx| versus
+/// t_z ∝ (2m+1)/2·|dz|), so the perfect diagonal's corner touches can
+/// never be missed to float rounding. The start tile is assumed (the
+/// caller stands on it); every tile after it, goal included, is checked.
+pub fn line_of_sight(map: &Map, from: Tile, to: Tile) -> bool {
+    let (dx, dz) = (to.x - from.x, to.z - from.z);
+    if dx == 0 && dz == 0 {
+        return map.walkable(from);
+    }
+    let (adx, adz) = (dx.unsigned_abs() as u128, dz.unsigned_abs() as u128);
+    let (sx, sz) = (dx.signum(), dz.signum());
+    let (mut x, mut z) = (from.x, from.z);
+    let (mut kx, mut kz) = (0u128, 0u128); // boundary crossings consumed
+    let walk = |x: i32, z: i32| map.walkable(Tile { x, z });
+    while (x, z) != (to.x, to.z) {
+        // Both exhausted is impossible inside the loop: it means the
+        // walk already reached `to`.
+        let tx = if kx < adx {
+            (2 * kx + 1) * adz
+        } else {
+            u128::MAX
+        };
+        let tz = if kz < adz {
+            (2 * kz + 1) * adx
+        } else {
+            u128::MAX
+        };
+        if tx < tz {
+            x += sx;
+            kx += 1;
+            if !walk(x, z) {
+                return false;
+            }
+        } else if tz < tx {
+            z += sz;
+            kz += 1;
+            if !walk(x, z) {
+                return false;
+            }
+        } else {
+            // Exact corner: the segment passes through the lattice
+            // point, touching both flanks on the way.
+            if !walk(x + sx, z) || !walk(x, z + sz) {
+                return false;
+            }
+            x += sx;
+            z += sz;
+            kx += 1;
+            kz += 1;
+        }
+    }
+    true
+}
+
+/// String-pull smoothing over a found route (the fluency half of the
+/// stair-shuffle fix, `docs/animation/qualities.md` "Path fluency"):
+/// keep exactly the waypoints needed so consecutive kept waypoints
+/// have walkable [`line_of_sight`] — a blank-map stair collapses into
+/// one straight diagonal leg, while bends a wall forces survive as
+/// corners. The output is always a **subsequence** of `route` (start
+/// and goal kept), so the walk stays grid-faithful: it only ever aims
+/// at tiles A* already chose. `out` is caller-reused, cleared first —
+/// the buffer-is-the-API law. Send-time by design (Update on click),
+/// never per tick.
+pub fn smooth_route(map: &Map, route: &[Tile], out: &mut Vec<Tile>) {
+    out.clear();
+    let Some(&start) = route.first() else {
+        return;
+    };
+    out.push(start);
+    let mut i = 0;
+    while i + 1 < route.len() {
+        // Furthest waypoint still visible from the last kept one;
+        // adjacency (j == i+1) is always acceptable — the route itself
+        // vouches for that hop.
+        let mut j = route.len() - 1;
+        while j > i + 1 && !line_of_sight(map, route[i], route[j]) {
+            j -= 1;
+        }
+        out.push(route[j]);
+        i = j;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,6 +446,167 @@ mod tests {
             // And the reused buffer agrees with the allocating wrapper.
             assert!(reused.find_path_into(&map, start, goal, &mut out));
             assert_eq!(out, via_fresh.unwrap_or_default());
+        }
+    }
+
+    /// The smoothing laws, once, for every route this module's other
+    /// tests produce: a subsequence of the input (endpoints kept) with
+    /// walkable line of sight between consecutive kept waypoints.
+    fn assert_valid_smooth(map: &Map, route: &[Tile], smooth: &[Tile]) {
+        assert_eq!(smooth.first(), route.first(), "smooth must keep the start");
+        let Some(&last) = route.last() else { return };
+        assert_eq!(smooth.last(), Some(&last), "smooth must keep the goal");
+        let mut next = 0; // order-preserving subset check
+        for &t in smooth {
+            let Some(pos) = route[next..].iter().position(|&r| r == t) else {
+                panic!("smoothed waypoint {t:?} is not on the route");
+            };
+            next += pos + 1;
+        }
+        for pair in smooth.windows(2) {
+            assert!(
+                line_of_sight(map, pair[0], pair[1]),
+                "smoothed leg {:?} -> {:?} lost line of sight",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    /// Line of sight is conservative: every touched tile must be
+    /// walkable, an exact corner crossing counts both flanks, and the
+    /// integer-exact comparison catches the perfect diagonal's corners.
+    #[test]
+    fn line_of_sight_is_conservative() {
+        let mut map = Map::blank(16, 16);
+        let a = Tile { x: 2, z: 2 };
+        let b = Tile { x: 6, z: 6 };
+        assert!(line_of_sight(&map, a, b), "blank diagonal must be visible");
+        assert!(line_of_sight(&map, b, a), "sight is symmetric");
+        assert!(line_of_sight(
+            &map,
+            Tile { x: 0, z: 0 },
+            Tile { x: 0, z: 0 }
+        ));
+        // The center-to-center diagonal clips every lattice corner, so
+        // blocking either flank at the first corner breaks it.
+        map.set_occupancy(Tile { x: 3, z: 2 }, Occupancy::BLOCKED);
+        assert!(
+            !line_of_sight(&map, a, b),
+            "a blocked flank must break the diagonal"
+        );
+        // Axis lines die on a mid-line tile.
+        let mut map2 = Map::blank(16, 16);
+        map2.set_occupancy(Tile { x: 0, z: 2 }, Occupancy::BLOCKED);
+        assert!(!line_of_sight(
+            &map2,
+            Tile { x: 0, z: 0 },
+            Tile { x: 0, z: 4 }
+        ));
+        // Off the blocking tile's row, sight returns.
+        assert!(line_of_sight(
+            &map2,
+            Tile { x: 1, z: 0 },
+            Tile { x: 1, z: 4 }
+        ));
+    }
+
+    /// The stair-shuffle fix, pinned: on open ground a stair-stepped
+    /// diagonal (exactly what 4-neighborhood A* hands back) collapses
+    /// to one straight leg, and a wall in the diagonal's flank forces a
+    /// bend to survive. Trivial routes pass through untouched.
+    #[test]
+    fn smooth_route_collapses_stairs_and_keeps_corners() {
+        let map = Map::blank(16, 16);
+        let stair: Vec<Tile> = [
+            (2, 2),
+            (3, 2),
+            (3, 3),
+            (4, 3),
+            (4, 4),
+            (5, 4),
+            (5, 5),
+            (6, 5),
+            (6, 6),
+        ]
+        .iter()
+        .map(|&(x, z)| Tile { x, z })
+        .collect();
+        let mut out = Vec::new();
+        smooth_route(&map, &stair, &mut out);
+        assert_eq!(
+            out,
+            vec![Tile { x: 2, z: 2 }, Tile { x: 6, z: 6 }],
+            "an open stair must collapse to one diagonal leg"
+        );
+
+        // A blocked flank tile kills the far sightline, so the smooth
+        // keeps an intermediate bend around it — route on the walled
+        // map (A* detours; the fixture must be a route of that map).
+        let mut walled = Map::blank(16, 16);
+        walled.set_occupancy(Tile { x: 3, z: 2 }, Occupancy::BLOCKED);
+        let mut pf = Pathfinder::new(&walled);
+        let start = Tile { x: 2, z: 2 };
+        let goal = Tile { x: 6, z: 6 };
+        let route = pf.find_path(&walled, start, goal).unwrap_or_default();
+        assert!(!route.is_empty());
+        smooth_route(&walled, &route, &mut out);
+        assert_valid_smooth(&walled, &route, &out);
+        assert!(out.len() > 2, "the wall must force a bend: {out:?}");
+
+        // The wall-detour route from the A* tests smooths legally and
+        // loses the staircase around the gap's corners.
+        let mut gap_map = Map::blank(16, 16);
+        for z in 0..16 {
+            if z != 10 {
+                gap_map.set_occupancy(Tile { x: 8, z }, Occupancy::BLOCKED);
+            }
+        }
+        let mut pf = Pathfinder::new(&gap_map);
+        let start = Tile { x: 2, z: 4 };
+        let goal = Tile { x: 14, z: 4 };
+        let route = pf.find_path(&gap_map, start, goal).unwrap_or_default();
+        assert_eq!(route.len(), 25);
+        smooth_route(&gap_map, &route, &mut out);
+        assert_valid_smooth(&gap_map, &route, &out);
+        assert!(out.len() < route.len(), "the detour must shorten: {out:?}");
+
+        // Trivial routes pass through; empty stays empty.
+        let one = vec![Tile { x: 5, z: 5 }];
+        smooth_route(&map, &one, &mut out);
+        assert_eq!(out, one);
+        smooth_route(&map, &[], &mut out);
+        assert!(out.is_empty(), "out must be cleared, not appended");
+    }
+
+    /// Generated meadows smooth for real: every A* route across the
+    /// seed-42 map obeys the smoothing laws, and the smoothed walk is
+    /// never longer-legged into unwalkable ground.
+    #[test]
+    fn meadow_routes_smooth_lawfully() {
+        let map = meadow();
+        let mut pf = Pathfinder::new(&map);
+        let mut rng = crate::sim::Rng::new(11);
+        let mut route = Vec::new();
+        let mut out = Vec::new();
+        for _ in 0..30 {
+            let start = walkable_from(
+                &map,
+                (rng.next_u64() % 60) as i32,
+                (rng.next_u64() % 60) as i32,
+            )
+            .unwrap_or(Tile { x: 0, z: 0 });
+            let goal = walkable_from(
+                &map,
+                (rng.next_u64() % 60) as i32,
+                (rng.next_u64() % 60) as i32,
+            )
+            .unwrap_or(Tile { x: 63, z: 63 });
+            if !pf.find_path_into(&map, start, goal, &mut route) {
+                continue; // islands refuse; only found routes smooth
+            }
+            smooth_route(&map, &route, &mut out);
+            assert_valid_smooth(&map, &route, &out);
         }
     }
 }
