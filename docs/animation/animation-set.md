@@ -165,9 +165,10 @@ the way the walk is pinned today.
    done): jump + punch established mechanisms 1 and 2, plus the
    vertical channel the jump owns (ballistic arc, stride freeze
    mid-air, landing absorption).
-2. **Carry + bend-and-reach** — first locomotion-safe consumers of the
-   layer, plus the highest-reuse work primitive; no posture machinery
-   yet (tracked as `carry-reach`).
+2. **Carry + bend-and-reach** — landed 2026-09-23 (`carry-reach`,
+   done): chest/side holds with eased blends and stride shortening,
+   and the bend/hold/rise one-shot (a lean — the posture tier still
+   owns root-height changes; ground-level pickup deepens then).
 3. **Work tier** — two-handed swing, one-handed swing, tend-station
    loop.
 4. **Posture tier** — mechanism 3, then meditation, sleep, death.

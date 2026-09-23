@@ -119,11 +119,11 @@ is zero-allocation at steady state, gated by `[steady.*]` entries in
 
 `--viewer` opens a 1280×800 3D scene: a 24×24 m checkerboard meadow,
 the driven stick figure (warm ink), seven ambient circle-walkers
-(slate), blob shadows, and a follow camera at the SVG renderer's
-establishing-shot orientation (the eye→target direction held constant
-while tracking the selected figure — offline renders and the live view
-share an angle). It exists only behind the dev-only `viewer` cargo
-feature (bevy's winit/3D-pbr/sprite/text stack), so the default
+(slate), blob shadows, and an orthographic tactical follow camera
+(ADR 0006): ~15.5° elevation at 49° azimuth — deliberately off the
+45° diagonal so the tiles never read as regular wallpaper — tracking
+the selected figure. It exists only behind the dev-only `viewer`
+cargo feature (bevy's winit/3D-pbr/sprite/text stack), so the default
 dependency graph (77 external crates), the wasm gate, and the size
 budgets are untouched.
 
@@ -137,7 +137,9 @@ to send it walking there (a red disc marks the goal until arrival —
 the plugin's `MoveTarget` controller, pinned by headless tests).
 Keyboard drive applies to the selected figure and overrides a send;
 clicking the selected figure again returns control to the player
-figure.
+figure. The camera defaults to orthographic; `O` toggles a
+perspective view of the same orientation, and zoom rides the ortho
+scale so `-/+` work identically in both.
 
 | input       | action                                    |
 | ----------- | ----------------------------------------- |
@@ -147,24 +149,34 @@ figure.
 | A / D       | turn                                      |
 | Space       | jump (hold: bounce on every landing)      |
 | F           | punch (hold: chained cycles)              |
+| E           | bend-and-reach (hold: chained grabs)      |
+| C           | toggle chest carry                        |
+| O           | toggle orthographic ↔ perspective         |
 | P           | pause (the sim, not the renderer)         |
 | R           | reset the player figure home              |
 | − / =       | zoom out / in                             |
 | Esc         | quit                                      |
 
-The readout (top-left) shows scene/seed with the selection, live speed
-with the gait band, the active action (air height / punch phase),
-`t / tick / alpha`, heel strikes, and the key map.
+The readout (top-left) shows scene/seed with the selection and camera
+mode, live speed with the gait band, the active action (air height /
+punch / reach phase) and carry state, `t / tick / alpha`, heel
+strikes, and the key map.
+
+The `carry` scene is the carry channel's gallery: twelve porters on
+nested rings carrying round-robin (chest holds, side holds,
+empty-handed), the loaded walks shortening their strides —
+`--scene carry` works in the headless harness and the SVG render too.
 
 Smoke test without touching the keyboard:
 
 ```sh
 cargo run -p bw-walker-gallery --features viewer -- \
   --viewer --viewer-shot /tmp/walker.png
-# writes /tmp/walker-{walk,air,strike,run,sent}.png (walk at t=1.5s,
-# hop apex ~2.3s, run-punch strike ~5.25s, full run 6.5s, and a
-# scripted click-to-move send walking to its goal disc at 7.4s),
-# exits at t=8.6s
+# writes /tmp/walker-{walk,air,grab,carry,strike,run,sent,persp}.png
+# (walk 1.5s, hop apex ~2.3s, walk-reach ~3.25s, chest carry ~4.3s,
+# run-punch strike ~5.25s, full run 6.5s, click-to-move send ~7.4s —
+# all under the default ortho camera — then the send in perspective
+# ~8.15s), exits at t=8.8s
 ```
 
 Tests for the viewer's pure logic (key map, follow-camera geometry,

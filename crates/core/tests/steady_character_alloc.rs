@@ -5,7 +5,7 @@
 //! for the same reason as `steady_alloc.rs`: the dhat global allocator
 //! is process-wide.
 
-use bw_core::character::{Character, CharacterPose, MovementInput, Skeleton, circle_input};
+use bw_core::character::{Carry, Character, CharacterPose, MovementInput, Skeleton, circle_input};
 
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
@@ -23,10 +23,14 @@ fn steady_state_character_step_and_pose_allocate_nothing() {
         Character::new(bw_core::math::Vec3::new(5.0, 0.0, 0.0), 1.2),
     ];
     walkers[1].scale = 1.07;
+    // The carry channel eases through both holds during the window.
+    walkers[0].carry = Carry::Chest;
+    walkers[1].carry = Carry::Side;
     let mut poses: Vec<CharacterPose> = walkers.iter().map(|_| CharacterPose::new(&skel)).collect();
     // Idle, walk, and run input bands all exercise the same pose pass;
-    // the action requests drive the jump/punch channels (launch, arc,
-    // landing absorption, windup/strike/recover) through it too.
+    // the action requests drive the jump/punch/reach channels (launch,
+    // arc, landing absorption, windup/strike/recover, bend/hold/rise)
+    // through it too.
     let mut inputs = vec![
         MovementInput::default(),
         circle_input(5.0, 1.35, 1.0),
@@ -36,8 +40,11 @@ fn steady_state_character_step_and_pose_allocate_nothing() {
     bounce.jump = true;
     let mut flurry = circle_input(7.0, 3.6, -1.0);
     flurry.punch = true;
+    let mut chores = circle_input(5.0, 1.35, 1.0);
+    chores.reach = true;
     inputs.push(bounce);
     inputs.push(flurry);
+    inputs.push(chores);
 
     // Warm: dhat callsite bookkeeping and first-touch growth settle
     // before the measured window opens.

@@ -326,6 +326,34 @@ const TUCK_SPLAY: f32 = 0.40;
 /// Punch duration (s) — one windup/strike/recover cycle.
 pub const PUNCH_DUR: f32 = 0.45;
 
+/// Bend-and-reach duration (s): bend in, hold, rise — the
+/// pickup/place/harvest primitive (tier 2 of the animation roadmap).
+pub const REACH_DUR: f32 = 0.90;
+
+/// Carry blend rate (1/s): the hold eases in/out over ~0.17 s.
+const CARRY_BLEND: f32 = 6.0;
+/// Stride scale under a chest carry: loaded walks shorten the stride
+/// (same speed, quicker cadence).
+const CARRY_STRIDE_CHEST: f32 = 0.85;
+/// Stride scale under a side carry (one hand, lighter).
+const CARRY_STRIDE_SIDE: f32 = 0.95;
+
+/// What the hands hold (the carry channel). Gameplay sets this when a
+/// figure picks up or sets down a load; the pose eases toward it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Carry {
+    /// Nothing (the default).
+    #[default]
+    None,
+    /// A two-handed hold at the chest (crate, jar): both arms bent in
+    /// front, hands near the center line at chest height, stride
+    /// shortened under load.
+    Chest,
+    /// A one-handed hold at the side (bucket, tool): the right arm
+    /// hangs loaded, the left keeps swinging.
+    Side,
+}
+
 /// Landing absorption envelope: 1 at touchdown easing quadratically
 /// to 0 over [`LAND_WIN`] seconds (a decay that reads as muscular,
 /// not spring-loaded).
@@ -358,6 +386,9 @@ pub struct MovementInput {
     /// idle; requests during the action are ignored (no queueing).
     /// Held, it chains cycles back-to-back.
     pub punch: bool,
+    /// Bend-and-reach request: same one-shot semantics as the punch —
+    /// one cycle per idle request, chained when held.
+    pub reach: bool,
 }
 
 /// Deterministic circle-path input: walk a circle of `radius` at `speed`
@@ -371,6 +402,7 @@ pub fn circle_input(radius: f32, speed: f32, dir: f32) -> MovementInput {
         turn_rate: dir * speed / radius.max(0.1),
         jump: false,
         punch: false,
+        reach: false,
     }
 }
 
@@ -411,6 +443,15 @@ pub struct Character {
     /// Punch phase in `0..1` (one [`PUNCH_DUR`] cycle); `None` = the
     /// arm channel is idle and the gait swing owns it.
     pub punch: Option<f32>,
+    /// Bend-and-reach phase in `0..1` (one [`REACH_DUR`] cycle);
+    /// `None` = idle.
+    pub reach: Option<f32>,
+    /// Carry intent: what the hands hold. Set by gameplay (pick up /
+    /// set down); the pose eases toward it.
+    pub carry: Carry,
+    /// Eased carry activation `0..1` — how far into the hold the arms
+    /// are (0 = no hold visible).
+    pub carry_b: f32,
 }
 
 impl Character {
@@ -427,6 +468,9 @@ impl Character {
             vy: 0.0,
             land_t: LAND_WIN,
             punch: None,
+            reach: None,
+            carry: Carry::None,
+            carry_b: 0.0,
         }
     }
 
@@ -483,9 +527,10 @@ impl Character {
 
         // Stride locks to ground travel: no contact, no stepping and
         // no heel strikes — the gait freezes mid-stride through the
-        // air and resumes on touchdown.
+        // air and resumes on touchdown. A carried load shortens the
+        // stride (same speed, quicker cadence).
         if self.grounded() {
-            let stride = gait_at(self.speed).stride_len.max(0.1);
+            let stride = (gait_at(self.speed).stride_len * self.stride_scale()).max(0.1);
             let before = self.phase;
             self.phase += TAU * self.speed / stride * dt;
             let strikes =
@@ -504,6 +549,33 @@ impl Character {
             }
             None => None,
         };
+
+        // Bend-and-reach: the same one-shot semantics as the punch.
+        self.reach = match self.reach {
+            None if input.reach => Some(0.0),
+            Some(p) => {
+                let next = p + dt / REACH_DUR;
+                (next < 1.0).then_some(next)
+            }
+            None => None,
+        };
+
+        // Carry: the hold eases toward the current intent.
+        let carry_want = if self.carry == Carry::None { 0.0 } else { 1.0 };
+        let max_delta = CARRY_BLEND * dt;
+        self.carry_b += (carry_want - self.carry_b).clamp(-max_delta, max_delta);
+    }
+
+    /// Stride multiplier under the current carry (eased with the hold:
+    /// an empty-handed figure strides full length, a chest carry at
+    /// `CARRY_STRIDE_CHEST`, a side carry between).
+    fn stride_scale(&self) -> f32 {
+        let loaded = match self.carry {
+            Carry::None => 1.0,
+            Carry::Chest => CARRY_STRIDE_CHEST,
+            Carry::Side => CARRY_STRIDE_SIDE,
+        };
+        1.0 + (loaded - 1.0) * self.carry_b
     }
 
     /// Joint starts and tips in world space at the current state, into
@@ -545,6 +617,19 @@ impl Character {
             ),
         };
         let p_act = p_wind.max(p_ext);
+        // Bend-and-reach envelope: ease in, hold the grab, rise — and
+        // die fully before the cycle ends, so the pose returns to the
+        // gait bit-for-bit (same contract as the punch envelopes).
+        let r_bend = match self.reach {
+            None => 0.0,
+            Some(p) => smoothstep(0.0, 0.35, p) * (1.0 - smoothstep(0.55, 0.95, p)),
+        };
+        // Loaded figures lean into the carry a little.
+        let carry_lean = match self.carry {
+            Carry::Chest => 0.08,
+            Carry::Side => 0.03,
+            Carry::None => 0.0,
+        } * self.carry_b;
         let root_pos = self.pos
             + root_rot.rotate(offset)
             + Vec3::new(
@@ -567,11 +652,13 @@ impl Character {
         q_anim[bone::HIPS] = Quat::from_rotation_y(hip_yaw);
         // The punch rides the torso too: windup coils the right
         // shoulder back, the strike throws it forward with a lean.
+        // The reach bends it toward the target (a lean, not a
+        // root-height change — the posture tier owns those).
         q_anim[bone::TORSO] =
             Quat::from_rotation_y(gait.torso_sway * b_w * sin_phi + 0.50 * p_ext - 0.20 * p_wind)
-                * Quat::from_rotation_x(lean + breath + 0.12 * p_ext);
+                * Quat::from_rotation_x(lean + breath + carry_lean + 0.12 * p_ext + 0.70 * r_bend);
         q_anim[bone::HEAD] = Quat::from_rotation_y(-gait.torso_sway * 0.6 * b_w * sin_phi)
-            * Quat::from_rotation_x(-lean * 0.6);
+            * Quat::from_rotation_x(-(lean + carry_lean) * 0.6 - 0.17 * r_bend);
 
         for is_left in [true, false] {
             let ph = phi + if is_left { 0.0 } else { std::f32::consts::PI };
@@ -586,6 +673,34 @@ impl Character {
             let ankle = gait.foot * b_w * (0.4 * swing_gate(ph) - push_gate(ph)) + air * TUCK_FOOT;
             let mut arm_pitch = gait.arm * b_w * s; // same-side arm counters leg
             let mut elbow_flex = elbow_base + 0.35 * gait.arm * b_w * (-s).max(0.0) + air * 0.25;
+            // Carry holds: the gait swing fades with activation into
+            // the hold — chest bends both arms in front (hands toward
+            // the center line at chest height), side loads the right
+            // arm at rest while the left keeps swinging.
+            let c_b = self.carry_b;
+            match self.carry {
+                Carry::Chest => {
+                    arm_pitch = arm_pitch * (1.0 - c_b) - 0.55 * c_b; // elbows forward
+                    elbow_flex = elbow_flex * (1.0 - c_b) + 1.50 * c_b; // hands up-front
+                }
+                Carry::Side if !is_left => {
+                    arm_pitch *= 1.0 - c_b; // loaded arm hangs
+                    elbow_flex = elbow_flex * (1.0 - c_b) + 0.10 * c_b;
+                }
+                _ => {}
+            }
+            // Bend-and-reach: the right arm swings down-forward into
+            // the target — pitched past the torso's own bend, since
+            // the channel is local to the already-pitched torso —
+            // near straight, with the left counterbalancing back.
+            // Fades out fully, so whatever owns the channel next
+            // resumes cleanly.
+            if !is_left {
+                arm_pitch = arm_pitch * (1.0 - r_bend) - 1.05 * r_bend;
+                elbow_flex *= 1.0 - r_bend;
+            } else {
+                arm_pitch += 0.30 * r_bend;
+            }
             if is_left {
                 // Left arm guards through the strike: raised, curled.
                 arm_pitch += -0.35 * p_ext;
@@ -594,7 +709,8 @@ impl Character {
                 // Right arm carries the punch: the gait swing fades
                 // with activation, windup coils (arm back, elbow
                 // curled), strike extends (arm forward-horizontal,
-                // elbow straight).
+                // elbow straight). Applied last: the strike owns the
+                // channel over a carry or reach.
                 arm_pitch = arm_pitch * (1.0 - p_act) + 0.55 * p_wind - 1.60 * p_ext;
                 elbow_flex = elbow_flex * (1.0 - p_act) + 1.55 * p_wind;
             }
@@ -818,6 +934,7 @@ mod tests {
             turn_rate: 0.0,
             jump: false,
             punch: false,
+            reach: false,
         };
         let ticks = 600;
         for _ in 0..ticks {
@@ -846,6 +963,7 @@ mod tests {
             turn_rate: 0.0,
             jump: false,
             punch: false,
+            reach: false,
         };
         let mut min_y = [f32::MAX; 2];
         let mut max_y = [-f32::MAX; 2];
@@ -942,6 +1060,7 @@ mod tests {
             turn_rate: 0.0,
             jump: false,
             punch: false,
+            reach: false,
         };
         c.step(SIM_DT, &fast);
         assert!((c.speed - ACCEL * SIM_DT).abs() < 1e-6);
@@ -1204,8 +1323,8 @@ mod tests {
     }
 
     /// The action channels keep stepping deterministic: the same
-    /// jump/punch request pattern reproduces the same state and pose
-    /// checksum over a 10 s walk.
+    /// jump/punch/reach request pattern and carry schedule reproduce
+    /// the same state and pose checksum over a 10 s walk.
     #[test]
     fn action_stepping_is_deterministic() {
         let skel = Skeleton::humanoid();
@@ -1217,7 +1336,13 @@ mod tests {
                     target_speed: 1.35,
                     jump: k % 40 == 0,
                     punch: k % 13 == 0,
+                    reach: k % 17 == 0,
                     ..Default::default()
+                };
+                c.carry = match k / 150 {
+                    0 => Carry::None,
+                    1 => Carry::Chest,
+                    _ => Carry::Side,
                 };
                 c.step(SIM_DT, &input);
                 c.pose_into(&skel, &mut pose);
@@ -1228,10 +1353,221 @@ mod tests {
                 c.land_t,
                 c.phase,
                 c.punch,
+                c.reach,
+                c.carry,
+                c.carry_b,
                 c.footfalls,
                 pose.checksum(),
             )
         };
         assert_eq!(run(), run());
+    }
+
+    /// The carry hold eases monotonically toward its intent and back,
+    /// without overshoot.
+    #[test]
+    fn carry_blends_in_and_out() {
+        let mut c = walker(0.0);
+        c.carry = Carry::Chest;
+        let mut last = 0.0;
+        for _ in 0..30 {
+            c.step(SIM_DT, &MovementInput::default());
+            assert!(c.carry_b >= last - 1e-6, "blend must not dip");
+            last = c.carry_b;
+            if last >= 1.0 {
+                break;
+            }
+        }
+        assert!((c.carry_b - 1.0).abs() < 1e-4, "never fully held: {last}");
+        c.carry = Carry::None;
+        let mut last = 1.0;
+        for _ in 0..30 {
+            c.step(SIM_DT, &MovementInput::default());
+            assert!(c.carry_b <= last + 1e-6, "blend must not overshoot");
+            last = c.carry_b;
+            if last <= 0.0 {
+                break;
+            }
+        }
+        assert_eq!(c.carry_b, 0.0);
+    }
+
+    /// A chest carry holds both hands at the chest — forward of the
+    /// torso, near the center line, in the chest height band — and
+    /// suppresses the gait arm swing while walking.
+    #[test]
+    fn chest_carry_holds_both_hands_at_the_chest() {
+        let skel = Skeleton::humanoid();
+        let mut pose = CharacterPose::new(&skel);
+        let input = MovementInput {
+            target_speed: 1.35,
+            ..Default::default()
+        };
+        let mut c = walker(1.35);
+        c.carry = Carry::Chest;
+        for _ in 0..60 {
+            c.step(SIM_DT, &input); // blend fully in, walking
+        }
+        let mut wrist_z = (f32::MAX, f32::MIN);
+        for _ in 0..240 {
+            c.step(SIM_DT, &input);
+            c.pose_into(&skel, &mut pose);
+            for la in [bone::LOWER_ARM_L, bone::LOWER_ARM_R] {
+                let tip = pose.tip[la];
+                assert!(
+                    tip.y > 1.05 && tip.y < 1.50,
+                    "wrist off the chest band: {}",
+                    tip.y
+                );
+                assert!(tip.x.abs() < 0.20, "hands drift from center: {}", tip.x);
+            }
+            let z = pose.tip[bone::LOWER_ARM_L].z - pose.start[bone::HIPS].z;
+            wrist_z = (wrist_z.0.min(z), wrist_z.1.max(z));
+        }
+        assert!(
+            wrist_z.1 - wrist_z.0 < 0.08,
+            "the hold must not swing: {wrist_z:?}"
+        );
+    }
+
+    /// A side carry loads only the right arm: it hangs near rest while
+    /// the left keeps swinging.
+    #[test]
+    fn side_carry_loads_only_the_right_arm() {
+        let skel = Skeleton::humanoid();
+        let mut pose = CharacterPose::new(&skel);
+        let input = MovementInput {
+            target_speed: 1.35,
+            ..Default::default()
+        };
+        let mut c = walker(1.35);
+        c.carry = Carry::Side;
+        for _ in 0..60 {
+            c.step(SIM_DT, &input);
+        }
+        let mut rz = (f32::MAX, f32::MIN);
+        let mut lz = (f32::MAX, f32::MIN);
+        for _ in 0..240 {
+            c.step(SIM_DT, &input);
+            c.pose_into(&skel, &mut pose);
+            rz = (
+                rz.0.min(pose.tip[bone::LOWER_ARM_R].z - pose.start[bone::HIPS].z),
+                rz.1.max(pose.tip[bone::LOWER_ARM_R].z - pose.start[bone::HIPS].z),
+            );
+            lz = (
+                lz.0.min(pose.tip[bone::LOWER_ARM_L].z - pose.start[bone::HIPS].z),
+                lz.1.max(pose.tip[bone::LOWER_ARM_L].z - pose.start[bone::HIPS].z),
+            );
+        }
+        assert!(rz.1 - rz.0 < 0.08, "loaded arm must hang still: {rz:?}");
+        assert!(lz.1 - lz.0 > 0.20, "free arm must keep swinging: {lz:?}");
+        assert!(
+            pose.tip[bone::LOWER_ARM_R].y < 1.05,
+            "bucket arm stays down"
+        );
+    }
+
+    /// Carrying shortens the stride: the same speed walk lands more
+    /// heel strikes per meter under a chest load.
+    #[test]
+    fn chest_carry_quickens_the_cadence() {
+        let run = |carry: Carry| {
+            let mut c = walker(1.35);
+            c.carry = carry;
+            let input = MovementInput {
+                target_speed: 1.35,
+                ..Default::default()
+            };
+            for _ in 0..600 {
+                c.step(SIM_DT, &input);
+            }
+            c.footfalls
+        };
+        let loaded = run(Carry::Chest);
+        let free = run(Carry::None);
+        assert!(loaded > free, "loaded {loaded} vs free {free}");
+    }
+
+    /// The bend-and-reach is one-shot: one request, one cycle of
+    /// `REACH_DUR`, no restarts while held, idle afterwards.
+    #[test]
+    fn reach_is_one_shot_and_recovers() {
+        let mut c = walker(0.0);
+        let grab = MovementInput {
+            reach: true,
+            ..Default::default()
+        };
+        c.step(SIM_DT, &grab);
+        assert_eq!(c.reach, Some(0.0));
+        let mut active = 0;
+        while c.reach.is_some() {
+            c.step(SIM_DT, &grab); // still requesting: must not restart
+            active += 1;
+            assert!(active < 200, "reach never ends");
+        }
+        let expected = REACH_DUR / SIM_DT;
+        assert!(
+            (active as f32 - expected).abs() <= 1.5,
+            "one cycle per request: {active} vs ~{expected}"
+        );
+        c.step(SIM_DT, &MovementInput::default());
+        assert_eq!(c.reach, None);
+        c.step(SIM_DT, &grab);
+        assert_eq!(c.reach, Some(0.0));
+    }
+
+    /// At the grab the torso pitches forward and the right hand drops
+    /// low and forward; by the cycle's end the pose is bit-for-bit
+    /// the gait's again.
+    #[test]
+    fn reach_bends_low_and_returns() {
+        let skel = Skeleton::humanoid();
+        let mut pose = CharacterPose::new(&skel);
+        let mut plain = CharacterPose::new(&skel);
+        walker(0.0).pose_into(&skel, &mut plain);
+        let mut c = walker(0.0);
+        c.reach = Some(0.45); // the grab plateau
+        c.pose_into(&skel, &mut pose);
+        let hips_z = pose.start[bone::HIPS].z;
+        assert!(
+            pose.tip[bone::HEAD].z - hips_z > 0.35,
+            "torso must pitch into the reach: {}",
+            pose.tip[bone::HEAD].z - hips_z
+        );
+        let wrist = pose.tip[bone::LOWER_ARM_R];
+        assert!(wrist.y < 1.05, "reaching hand must drop low: {}", wrist.y);
+        assert!(wrist.z > 0.45, "reaching hand must be forward: {}", wrist.z);
+        c.reach = Some(0.99);
+        c.pose_into(&skel, &mut pose);
+        assert_eq!(pose.checksum(), plain.checksum());
+    }
+
+    /// Reaching composes with the walk: through one request cycle the
+    /// stride keeps locking to the ground (heel strikes keep landing).
+    #[test]
+    fn reach_composes_with_the_walk() {
+        let mut c = walker(1.35);
+        let walk = MovementInput {
+            target_speed: 1.35,
+            ..Default::default()
+        };
+        let mut grab = walk;
+        grab.reach = true;
+        c.step(SIM_DT, &grab); // the one request
+        c.step(SIM_DT, &walk);
+        let mut active = 0;
+        while c.reach.is_some() {
+            c.step(SIM_DT, &walk);
+            active += 1;
+            assert!(active < 200, "reach never ends");
+        }
+        let ticks = 2 + active;
+        let strides = 1.35 * (ticks as f32 * SIM_DT) / WALK.stride_len;
+        let want = (strides * 2.0) as u64;
+        assert!(
+            (c.footfalls as i64 - want as i64).abs() <= 1,
+            "heel strikes {} vs ~{want}",
+            c.footfalls
+        );
     }
 }

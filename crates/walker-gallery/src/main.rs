@@ -81,6 +81,9 @@ pub struct ScenePreset {
     pub speed: (f32, f32),
     /// Fixed-speed presets use the same value for both bounds.
     pub fixed: Option<f32>,
+    /// Assign carries round-robin (chest / side / none) — the carry
+    /// channel's scene.
+    pub carry: bool,
 }
 
 fn scene_preset(id: &str) -> Option<ScenePreset> {
@@ -91,6 +94,7 @@ fn scene_preset(id: &str) -> Option<ScenePreset> {
             radius: (5.0, 5.0),
             speed: (WALK_SPEED, WALK_SPEED),
             fixed: Some(WALK_SPEED),
+            carry: false,
         }),
         // The same ring at run speed: the gait blend's upper band.
         "walk-run" => Some(ScenePreset {
@@ -98,6 +102,17 @@ fn scene_preset(id: &str) -> Option<ScenePreset> {
             radius: (7.0, 7.0),
             speed: (RUN_SPEED, RUN_SPEED),
             fixed: Some(RUN_SPEED),
+            carry: false,
+        }),
+        // Porters on nested rings, carrying round-robin: chest holds,
+        // side holds, and empty-handed — the loaded-walk read, with
+        // the shortened stride quickening the cadence.
+        "carry" => Some(ScenePreset {
+            count: 12,
+            radius: (3.0, 9.0),
+            speed: (1.1, 1.6),
+            fixed: None,
+            carry: true,
         }),
         // A crowd of 96 seeded walkers on nested rings — the
         // perf-heavy scene (96 × 13 = 1248 bone segments).
@@ -106,6 +121,7 @@ fn scene_preset(id: &str) -> Option<ScenePreset> {
             radius: (2.5, 12.0),
             speed: (0.9, 2.4),
             fixed: None,
+            carry: false,
         }),
         _ => None,
     }
@@ -145,6 +161,13 @@ pub fn build_scene(preset: &ScenePreset, seed: u64) -> Vec<SpawnSpec> {
         character.speed = 0.0; // eased in by the first ticks, like a real start
         character.phase = rng.range_f32(0.0, std::f32::consts::TAU);
         character.scale = rng.range_f32(0.92, 1.08);
+        if preset.carry {
+            character.carry = match k % 3 {
+                0 => bw_core::character::Carry::Chest,
+                1 => bw_core::character::Carry::Side,
+                _ => bw_core::character::Carry::None,
+            };
+        }
         specs.push(SpawnSpec {
             character,
             path: CirclePath { radius, speed, dir },

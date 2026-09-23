@@ -211,6 +211,7 @@ fn step_move_targets(mut query: Query<(&MoveTarget, &mut Walker)>) {
             turn_rate: (err * MOVE_TURN_GAIN).clamp(-MOVE_TURN, MOVE_TURN),
             jump: false,
             punch: false,
+            reach: false,
         };
     }
 }
@@ -524,6 +525,7 @@ mod tests {
                 turn_rate: 0.0,
                 jump: false,
                 punch: false,
+                reach: false,
             },
         );
         for _ in 0..30 {
@@ -568,6 +570,7 @@ mod tests {
                 turn_rate: 0.0,
                 jump: false,
                 punch: false,
+                reach: false,
             },
         );
         for _ in 0..10 {

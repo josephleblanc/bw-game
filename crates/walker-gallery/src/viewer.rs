@@ -26,10 +26,11 @@
 //! ## Scene
 //!
 //! A 24×24 m checkerboard meadow, the driven figure (warm ink), seven
-//! ambient circle-walkers (slate), blob shadows, and a follow camera
-//! at the SVG renderer's establishing-shot orientation (the
-//! eye→target direction, held constant while tracking the selected
-//! figure) — the live view and the offline renders share an angle.
+//! ambient circle-walkers (slate), blob shadows, and an orthographic
+//! tactical follow camera (ADR 0006): ~15.5° elevation at 49° azimuth
+//! — deliberately off the 45° diagonal so the tiles never read as
+//! regular wallpaper — tracking the selected figure. `O` toggles a
+//! perspective view of the same orientation.
 //!
 //! ## Control
 //!
@@ -55,7 +56,7 @@ use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::window::{PrimaryWindow, WindowResolution};
 
-use bw_core::character::{Character, MovementInput, Skeleton, bone};
+use bw_core::character::{Carry, Character, MovementInput, Skeleton, bone};
 use bw_core::math::Vec3 as BwVec3;
 use bw_core::time::SIM_DT;
 
@@ -74,16 +75,26 @@ const WIN_H: f32 = 800.0;
 const TILE: f32 = 1.0;
 const TILES: i32 = 24;
 
-/// Follow-camera offset direction: the SVG establishing shot's
-/// eye→target direction (normalized at runtime; a test pins the
-/// match). Same angle as the offline renders, closer in.
-fn follow_dir() -> BwVec3 {
-    (EYE - TARGET)
-        .normalized()
-        .unwrap_or(BwVec3::new(0.6, 0.27, 0.6))
+/// Tactical camera orientation (ADR 0006): azimuth 49° off the +z
+/// axis toward +x and ~15.5° elevation — the SVG establishing shot's
+/// steepness, but deliberately off the 45° diagonal so the
+/// checkerboard doesn't read as a perfectly regular wallpaper (one
+/// family of tile edges dominates; the asymmetric faces also give the
+/// view a directional hierarchy, the same trick isometric-style games
+/// use when they offset the classic angle).
+const CAM_AZIMUTH_DEG: f32 = 49.0;
+const CAM_ELEVATION_DEG: f32 = 15.5;
+
+/// The follow-camera offset direction (unit; a test pins azimuth and
+/// elevation so this and the ADR can't drift apart).
+fn follow_dir() -> Vec3 {
+    let az = CAM_AZIMUTH_DEG.to_radians();
+    let el = CAM_ELEVATION_DEG.to_radians();
+    Vec3::new(el.cos() * az.sin(), el.sin(), el.cos() * az.cos())
 }
-/// Follow distance at zoom 1 (m). The SVG camera sits ~19 m out to
-/// frame the whole scene; following one figure wants it nearer.
+/// Follow distance at zoom 1 (m). Meaningful to the perspective
+/// projection; the default orthographic camera frames by view height
+/// instead (zoom rides its `scale`).
 const FOLLOW_DIST: f32 = 11.0;
 const ZOOM_MIN: f32 = 0.5;
 const ZOOM_MAX: f32 = 2.5;
@@ -119,6 +130,9 @@ enum Action {
     Turn(i8),
     Jump,
     Punch,
+    Reach,
+    CarryCycle,
+    OrthoToggle,
     PauseToggle,
     Reset,
     Zoom(i8),
@@ -126,7 +140,7 @@ enum Action {
 }
 
 /// Keyboard → action mapping (pure; Bevy only calls it). Held keys are
-/// polled (`Forward`, `Turn`, `Jump`, `Punch`); the rest are
+/// polled (`Forward`, `Turn`, `Jump`, `Punch`, `Reach`); the rest are
 /// just-pressed.
 fn key_action(key: &KeyCode) -> Option<Action> {
     Some(match key {
@@ -137,12 +151,40 @@ fn key_action(key: &KeyCode) -> Option<Action> {
         KeyCode::KeyD | KeyCode::ArrowRight => Action::Turn(1),
         KeyCode::Space => Action::Jump,
         KeyCode::KeyF => Action::Punch,
+        KeyCode::KeyE => Action::Reach,
+        KeyCode::KeyC => Action::CarryCycle,
+        KeyCode::KeyO => Action::OrthoToggle,
         KeyCode::KeyP => Action::PauseToggle,
         KeyCode::KeyR => Action::Reset,
         KeyCode::Minus => Action::Zoom(1),
         KeyCode::Equal => Action::Zoom(-1),
         KeyCode::Escape => Action::Quit,
         _ => return None,
+    })
+}
+
+/// The orthographic alternative: same orientation, flat tactical
+/// read. The vertical view height matches the perspective framing at
+/// the follow distance (2·d·tan(fov/2) ≈ 8 m); zoom rides `scale`,
+/// which multiplies on top of the scaling mode.
+const ORTHO_VIEW_H: f32 = 8.0;
+
+fn ortho_projection() -> Projection {
+    Projection::Orthographic(bevy::camera::OrthographicProjection {
+        near: 0.1,
+        far: 200.0,
+        scaling_mode: bevy::camera::ScalingMode::FixedVertical {
+            viewport_height: ORTHO_VIEW_H,
+        },
+        ..bevy::camera::OrthographicProjection::default_3d()
+    })
+}
+
+/// The perspective default: the SVG renderer's fov at the follow rig.
+fn perspective_projection() -> Projection {
+    Projection::Perspective(PerspectiveProjection {
+        fov: FOV_Y_DEG.to_radians(),
+        ..default()
     })
 }
 
@@ -175,6 +217,13 @@ struct Viewer {
     input: MovementInput,
     /// Set by `Action::Reset`, consumed by the input applier.
     reset_pending: bool,
+    /// Set by `Action::CarryCycle`, consumed by the input applier
+    /// (carry is character state, not per-tick input).
+    carry_pending: bool,
+    /// Whether the main camera renders orthographically (`O`
+    /// toggles; zoom then rides the ortho `scale` instead of the
+    /// follow distance).
+    ortho: bool,
     /// Bumped on every applied action so the readout refreshes.
     edit_count: u32,
     /// Shared marker geometry/materials (spawn-once handles).
@@ -367,6 +416,8 @@ pub fn run(scene_id: &str, seed: u64, shot: Option<&str>) {
             zoom: 1.0,
             input: MovementInput::default(),
             reset_pending: false,
+            carry_pending: false,
+            ortho: true, // ADR 0006: orthographic is the tactical default
             edit_count: 0,
             kit,
         }
@@ -383,6 +434,7 @@ pub fn run(scene_id: &str, seed: u64, shot: Option<&str>) {
                 update_movement_alpha,
                 rig_follow,
                 camera_follow,
+                ortho_zoom,
                 update_readout,
                 auto_screenshot,
             )
@@ -495,10 +547,7 @@ fn setup_scene(
     commands.spawn((
         Camera3d::default(),
         Tonemapping::None,
-        Projection::Perspective(PerspectiveProjection {
-            fov: FOV_Y_DEG.to_radians(),
-            ..default()
-        }),
+        ortho_projection(), // ADR 0006: the tactical default; O toggles
         Transform::from_xyz(EYE.x, EYE.y, EYE.z)
             .looking_at(Vec3::new(TARGET.x, TARGET.y, TARGET.z), Vec3::Y),
         MainCamera,
@@ -598,6 +647,7 @@ fn handle_input(
     buttons: Res<ButtonInput<MouseButton>>,
     primary: Query<&Window, With<PrimaryWindow>>,
     camera_q: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
+    mut projections: Query<&mut Projection, With<MainCamera>>,
     walkers: Query<(Entity, &Walker)>,
     rings: Query<Entity, With<SelectionRing>>,
     goals: Query<Entity, With<GoalMarker>>,
@@ -682,10 +732,25 @@ fn handle_input(
                     let f = if d > 0 { ZOOM_STEP } else { 1.0 / ZOOM_STEP };
                     viewer.zoom = (viewer.zoom * f).clamp(ZOOM_MIN, ZOOM_MAX);
                 }
+                Action::CarryCycle => viewer.carry_pending = true,
+                Action::OrthoToggle => {
+                    viewer.ortho = !viewer.ortho;
+                    if let Ok(mut projection) = projections.single_mut() {
+                        *projection = if viewer.ortho {
+                            ortho_projection()
+                        } else {
+                            perspective_projection()
+                        };
+                    }
+                }
                 Action::Quit => {
                     exit.write(AppExit::Success);
                 }
-                Action::Forward(_) | Action::Turn(_) | Action::Jump | Action::Punch => {}
+                Action::Forward(_)
+                | Action::Turn(_)
+                | Action::Jump
+                | Action::Punch
+                | Action::Reach => {}
             }
         }
     }
@@ -701,6 +766,7 @@ fn handle_input(
         // so held keys read as bounce and chained cycles.
         jump: keys.any_pressed([KeyCode::Space]),
         punch: keys.any_pressed([KeyCode::KeyF]),
+        reach: keys.any_pressed([KeyCode::KeyE]),
     };
 }
 
@@ -775,6 +841,19 @@ fn apply_selection_input(
         walker.character.scale = scale;
         walker.input = MovementInput::default();
         return;
+    }
+    // `C` toggles the selected figure's chest carry (the other holds —
+    // like `Side` — are gameplay states the scenes set; the key is a
+    // plain two-state toggle like every other viewer control). Carry
+    // is character state, not per-tick input, so it lands here.
+    if viewer.carry_pending {
+        viewer.carry_pending = false;
+        if let Ok(mut walker) = walkers.get_mut(viewer.selected) {
+            walker.character.carry = match walker.character.carry {
+                Carry::Chest => Carry::None,
+                _ => Carry::Chest,
+            };
+        }
     }
     let Ok(mut walker) = walkers.get_mut(viewer.selected) else {
         return;
@@ -909,8 +988,7 @@ fn camera_follow(
         return;
     };
     let c = &walker.character;
-    let d = follow_dir();
-    let dir = Vec3::new(d.x, d.y, d.z);
+    let dir = follow_dir();
     let focus = Vec3::new(c.pos.x, 1.0, c.pos.z);
     let desired = focus + dir * (FOLLOW_DIST * viewer.zoom);
     let k = 1.0 - (-CAM_LERP * time.delta_secs()).exp();
@@ -921,6 +999,20 @@ fn camera_follow(
     state.position = Some(position);
     state.look = Some(look);
     *transform = Transform::from_translation(position).looking_at(look, Vec3::Y);
+}
+
+/// Orthographic zoom: distance is meaningless to an ortho camera, so
+/// `−/+` ride the projection's `scale` instead (scale up = smaller
+/// figures, the same "zoom out" semantics as the distance multiplier).
+fn ortho_zoom(viewer: Res<Viewer>, mut projections: Query<&mut Projection, With<MainCamera>>) {
+    if !viewer.ortho {
+        return;
+    }
+    if let Ok(mut projection) = projections.single_mut() {
+        if let Projection::Orthographic(ortho) = &mut *projection {
+            ortho.scale = viewer.zoom.max(0.05);
+        }
+    }
 }
 
 fn update_readout(
@@ -959,20 +1051,34 @@ fn update_readout(
     let action = if c.y > 0.0 {
         format!("air {:4.2} m", c.y)
     } else {
-        match c.punch {
-            Some(p) => format!("punch {:3.0}%", p * 100.0),
-            None => "—".to_string(),
+        match (c.punch, c.reach) {
+            (Some(p), _) => format!("punch {:3.0}%", p * 100.0),
+            (None, Some(p)) => format!("reach {:3.0}%", p * 100.0),
+            (None, None) => "—".to_string(),
         }
     };
+    let carry = match c.carry {
+        Carry::None if c.carry_b > 0.01 => format!("set down {:2.0}%", c.carry_b * 100.0),
+        Carry::None => "—".to_string(),
+        other => format!(
+            "{} {:2.0}%",
+            match other {
+                Carry::Chest => "chest",
+                Carry::Side => "side",
+                Carry::None => unreachable!(),
+            },
+            c.carry_b * 100.0
+        ),
+    };
+    let cam = if viewer.ortho { "ortho" } else { "persp" };
     let lines = [
         format!(
-            "walker-playground  scene {}  seed {}  sel {sel}",
+            "walker-playground  scene {}  seed {}  sel {sel}  {cam}",
             viewer.scene, viewer.seed
         ),
         format!(
-            "speed {:4.2} m/s  gait {gait}  target {:+.2}  action {action}  [{}]",
+            "speed {:4.2} m/s  gait {gait}  action {action}  carry {carry}  [{}]",
             c.speed,
-            walker.input.target_speed,
             if pause.0 { "PAUSED" } else { "running" }
         ),
         format!(
@@ -984,7 +1090,8 @@ fn update_readout(
             viewer.npcs.len() + 1,
         ),
         "click fig select · click ground send · W/S walk · Shift run".to_string(),
-        "A/D turn  Space jump  F punch  R reset  P pause  -/+ zoom  Esc".to_string(),
+        "A/D turn · Space jump · F punch · E reach · C carry · O ortho".to_string(),
+        "R reset  P pause  -/+ zoom  Esc quit".to_string(),
     ];
     let width = lines.iter().map(String::len).max().unwrap_or(0);
     text.0 = lines
@@ -1004,55 +1111,79 @@ struct ShotPlan {
 }
 
 /// The smoke's shot times (sim seconds): walking, mid-arc of the hop,
-/// mid-strike of the run-punch, full run, and mid-walk of a scripted
-/// click-to-move send.
-const SHOTS: [(f32, &str); 5] = [
+/// mid-bend of a walk-reach, a chest carry on the late walk, mid-strike
+/// of the run-punch, full run, mid-walk of a scripted click-to-move
+/// send — all under the default orthographic camera — then the send
+/// again after the scripted swap to perspective.
+const SHOTS: [(f32, &str); 8] = [
     (1.5, "walk"),
     (2.3, "air"),
+    (3.25, "grab"),
+    (4.3, "carry"),
     (5.25, "strike"),
     (6.5, "run"),
     (7.4, "sent"),
+    (8.15, "persp"),
 ];
-const SHOT_EXIT_T: f32 = 8.6;
+const SHOT_EXIT_T: f32 = 8.8;
 /// The scripted send fires here (sim seconds), after the run shot.
 const SHOT_SEND_T: f32 = 6.6;
-/// Action drive windows (sim seconds): one hop at 2.0 (airborne to
-/// ~2.48), punch held from 5.0 so the strike lands mid-run. The punch
-/// window also arcs the figure — a strike straight down the camera
-/// axis foreshortens to nothing, and the trailing camera reads the
-/// turning figure roughly side-on.
+/// The camera swaps to perspective here, during the sent walk (the
+/// default is orthographic — ADR 0006 — so the swap verifies the
+/// other projection).
+const SHOT_PERSP_T: f32 = 7.9;
+/// Drive schedule (sim seconds): walk from 0.3, run from 4.5; one hop
+/// at 2.0 (airborne to ~2.48); reach chained 2.8–3.7 through the walk;
+/// a chest carry held 3.9–4.4 (blending out as the run ramps); punch
+/// held 5.0–5.8 so the strike lands mid-run, arcing the figure — a
+/// strike straight down the camera axis foreshortens to nothing, and
+/// the trailing camera reads the turning figure roughly side-on.
+const RUN_START: f32 = 4.5;
 const JUMP_WINDOW: (f32, f32) = (2.0, 2.2);
+const REACH_WINDOW: (f32, f32) = (2.8, 3.7);
+const CARRY_WINDOW: (f32, f32) = (3.9, 4.4);
 const PUNCH_WINDOW: (f32, f32) = (5.0, 5.8);
 const PUNCH_ARC_TURN: f32 = 0.9; // rad/s through the punch window
 
 /// With `--viewer-shot`: auto-drive the figure (walk from 0.3 s, hop at
-/// 2.0 s, run from 3.5 s, punch from 5.0 s, click-to-move send at 6.6 s),
-/// capture the five shots, exit — the viewer's headless-ish verification
-/// hook, sim-time driven so captures are refresh-rate independent.
+/// 2.0 s, walk-reaches 2.8–3.7 s, chest carry 3.9–4.4 s, run from 4.5 s,
+/// punch from 5.0 s, click-to-move send at 6.6 s, perspective camera at
+/// 7.9 s), capture the eight shots, exit — the viewer's headless-ish
+/// verification hook, sim-time driven so captures are refresh-rate
+/// independent.
 fn auto_screenshot(
     plan: Option<Res<ShotPlan>>,
     mut viewer: ResMut<Viewer>,
-    walkers: Query<&Walker>,
-    mut fired: Local<[bool; 5]>,
+    mut walkers: Query<&mut Walker>,
+    mut projections: Query<&mut Projection, With<MainCamera>>,
+    mut fired: Local<[bool; 8]>,
     mut sent: Local<bool>,
+    mut ortho_on: Local<bool>,
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
 ) {
     let Some(plan) = plan else { return };
-    let Ok(walker) = walkers.get(viewer.player.walker) else {
-        return;
+    let t = match walkers.get(viewer.player.walker) {
+        Ok(walker) => walker.character.t,
+        Err(_) => return,
     };
-    let t = walker.character.t;
-    // Auto-drive: walk from 0.3 s, run from 3.5 s, one hop, then punch
-    // through the run (actions compose with the gait by construction).
+    // Auto-drive: walk, then run, then a scripted send (actions and
+    // carries compose with the gait by construction).
     if t >= 0.3 && t < SHOT_SEND_T {
-        viewer.input.target_speed = if t >= 3.5 { RUN_SPEED } else { WALK_SPEED };
+        viewer.input.target_speed = if t >= RUN_START {
+            RUN_SPEED
+        } else {
+            WALK_SPEED
+        };
     } else if t >= SHOT_SEND_T {
         // Release the drive: the scripted send owns the channel from
         // here (a nonzero keyboard input would cancel it).
         viewer.input = MovementInput::default();
         if !*sent {
             *sent = true;
+            let Ok(walker) = walkers.get(viewer.player.walker) else {
+                return;
+            };
             let c = &walker.character;
             let fwd = BwVec3::new(c.heading.sin(), 0.0, c.heading.cos());
             let left = BwVec3::new(c.heading.cos(), 0.0, -c.heading.sin());
@@ -1066,11 +1197,31 @@ fn auto_screenshot(
     }
     viewer.input.jump = (JUMP_WINDOW.0..JUMP_WINDOW.1).contains(&t);
     viewer.input.punch = (PUNCH_WINDOW.0..PUNCH_WINDOW.1).contains(&t);
+    viewer.input.reach = (REACH_WINDOW.0..REACH_WINDOW.1).contains(&t);
     viewer.input.turn_rate = if viewer.input.punch {
         PUNCH_ARC_TURN
     } else {
         0.0
     };
+    // Scripted carry: a chest hold through the late walk (character
+    // state, set directly — idempotent within the window).
+    if let Ok(mut walker) = walkers.get_mut(viewer.player.walker) {
+        walker.character.carry = if (CARRY_WINDOW.0..CARRY_WINDOW.1).contains(&t) {
+            Carry::Chest
+        } else {
+            Carry::None
+        };
+    }
+    // Scripted camera: perspective through the sent walk's tail (the
+    // default is orthographic, so this verifies the toggle's other
+    // side).
+    if !*ortho_on && t >= SHOT_PERSP_T {
+        *ortho_on = true;
+        viewer.ortho = false;
+        if let Ok(mut projection) = projections.single_mut() {
+            *projection = perspective_projection();
+        }
+    }
     for (k, (at, tag)) in SHOTS.iter().enumerate() {
         if !fired[k] && t >= *at {
             fired[k] = true;
@@ -1109,6 +1260,9 @@ mod tests {
         assert_eq!(key_action(&KeyCode::KeyD), Some(Action::Turn(1)));
         assert_eq!(key_action(&KeyCode::Space), Some(Action::Jump));
         assert_eq!(key_action(&KeyCode::KeyF), Some(Action::Punch));
+        assert_eq!(key_action(&KeyCode::KeyE), Some(Action::Reach));
+        assert_eq!(key_action(&KeyCode::KeyC), Some(Action::CarryCycle));
+        assert_eq!(key_action(&KeyCode::KeyO), Some(Action::OrthoToggle));
         assert_eq!(key_action(&KeyCode::KeyP), Some(Action::PauseToggle));
         assert_eq!(key_action(&KeyCode::KeyR), Some(Action::Reset));
         assert_eq!(key_action(&KeyCode::Minus), Some(Action::Zoom(1)));
@@ -1124,18 +1278,30 @@ mod tests {
         assert_eq!(shot_variant("prefix", "strike"), "prefix-strike");
     }
 
-    /// The follow camera holds the SVG establishing shot's orientation
-    /// at any zoom: the offset from the focus is the renderer's
-    /// eye→target direction, above the ground, at a sane range.
+    /// The follow camera holds the ADR 0006 orientation: unit length,
+    /// azimuth 49° off +z toward +x (off the 45° diagonal — the tile
+    /// wallpaper breaker), elevation ~15.5°, at a sane range.
     #[test]
-    fn follow_camera_holds_the_svg_orientation() {
+    fn follow_camera_holds_the_tactical_orientation() {
         let d = follow_dir();
-        let want = Vec3::new(EYE.x - TARGET.x, EYE.y - TARGET.y, EYE.z - TARGET.z).normalize();
+        assert!(
+            (d.length() - 1.0).abs() < 1e-5,
+            "not a unit direction: {d:?}"
+        );
+        let azimuth = d.x.atan2(d.z).to_degrees();
+        let elevation = d.y.asin().to_degrees();
+        assert!(
+            (azimuth - CAM_AZIMUTH_DEG).abs() < 0.01,
+            "azimuth drifted: {azimuth}"
+        );
+        assert!(
+            (elevation - CAM_ELEVATION_DEG).abs() < 0.01,
+            "elevation drifted: {elevation}"
+        );
+        assert!(azimuth != 45.0, "back on the 45° diagonal");
         for zoom in [ZOOM_MIN, 1.0, ZOOM_MAX] {
             let focus = Vec3::new(2.0, 1.0, -1.0);
-            let cam = focus + Vec3::new(d.x, d.y, d.z) * (FOLLOW_DIST * zoom);
-            let off = (cam - focus).normalize();
-            assert!(off.dot(want) > 0.9999, "orientation drifted: {off:?}");
+            let cam = focus + d * (FOLLOW_DIST * zoom);
             assert!(cam.y > 1.0, "camera below head height: {cam:?}");
             assert!(
                 (cam - focus).length() > 3.0,
