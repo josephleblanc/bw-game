@@ -28,6 +28,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y valgrind
       - name: Install wasm32 target (gate tier)
         run: rustup target add wasm32-unknown-unknown
+      # The pinned toolchain (rust-toolchain.toml) is installed with a
+      # minimal profile on runners — fmt/clippy components are missing.
+      - name: Install pinned-toolchain components
+        run: rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all --check
