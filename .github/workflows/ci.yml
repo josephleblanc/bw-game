@@ -1,0 +1,66 @@
+# PR + push gate (ADR 0001, D7): fmt, clippy, tests, wasm, then the
+# deterministic perf gates via xtask — this job is a required status
+# check; it is what makes the mandate real.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write # perf summary comment
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      PERF_RUNNER: github-ci
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install valgrind (iai-callgrind gate tier)
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+      - name: Install wasm32 target (gate tier)
+        run: rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy (workspace deny lints)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --workspace
+      - name: WASM check
+        run: cargo check --target wasm32-unknown-unknown -p bw-core -p bw-demo
+      - name: Perf gates (measure + check)
+        run: |
+          set -o pipefail
+          cargo xtask perf measure --out record.json --runner github-ci
+          cargo xtask perf check 2>&1 | tee check-output.txt
+      - name: Upload measurement record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-record
+          path: record.json
+      - name: Perf summary comment
+        if: github.event_name == 'pull_request'
+        continue-on-error: true # a comment failure must not fail CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          {
+            echo "#### perf check (runner: github-ci, commit ${GITHUB_SHA::7})"
+            echo
+            echo '```'
+            cat check-output.txt
+            echo '```'
+            echo
+            echo "Full measurement record attached to this run as the \`perf-record\` artifact."
+          } | gh pr comment "$PR" --edit-last --body-file -

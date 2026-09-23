@@ -1,0 +1,70 @@
+# Weekly trend job (ADR 0001, D2/D5/D6/D9): full measurement record,
+# attribution dumps, clean-build timing, record appended to the perf-data
+# branch, and the rendered report posted to the rolling perf-review issue.
+name: perf-trend
+
+on:
+  schedule:
+    - cron: "0 9 * * 1" # Mondays 09:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write # append records to perf-data
+  issues: write # rolling perf-review issue
+
+jobs:
+  trend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PERF_RUNNER: github-perf-trend
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install valgrind (iai-callgrind)
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+      - name: Install wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Measure
+        run: cargo xtask perf measure --out record.json --runner github-perf-trend
+      - name: Attribution dumps (D6)
+        run: |
+          cargo install cargo-bloat cargo-llvm-lines --locked
+          cargo xtask perf attribute --top 25
+      - name: Clean-check compile timing (advisory, D2/D8.5)
+        run: |
+          /usr/bin/time -v --output=clean-check-time.log cargo clean
+          /usr/bin/time -v --output=clean-check-time.log --append cargo check --workspace
+          grep -E 'Elapsed \(wall clock|Maximum resident set' clean-check-time.log
+      - name: Upload attribution and logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-attribution
+          path: |
+            record.json
+            clean-check-time.log
+            target/perf/attribution/
+      - name: Append record to perf-data (D5, append-only)
+        run: |
+          git fetch origin perf-data
+          git worktree add ../perf-data-checkout origin/perf-data
+          SHARD="records-$(date -u +%Y-%m).jsonl"
+          mkdir -p ../perf-data-checkout/records
+          jq -c . record.json >> "../perf-data-checkout/records/$SHARD"
+          git -C ../perf-data-checkout add records/
+          git -C ../perf-data-checkout -c user.name=perf-trend \
+            -c user.email=perf-trend@users.noreply.github.com \
+            commit -m "record $(date -u +%Y-%m-%dT%H:%M:%SZ) @ ${GITHUB_SHA::7}"
+          git -C ../perf-data-checkout push origin HEAD:perf-data
+      - name: Post report to the rolling perf-review issue (D9)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cargo xtask perf report --records ../perf-data-checkout/records --since 30d > report.md
+          gh label create perf-review --color 0e8a16 2>/dev/null || true
+          ISSUE=$(gh issue list --label perf-review --state open --json number --jq '.[0].number')
+          if [ -n "$ISSUE" ]; then
+            gh issue comment "$ISSUE" --body-file report.md
+          else
+            gh issue create --title "perf review (rolling)" --label perf-review --body-file report.md
+          fi

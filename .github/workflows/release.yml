@@ -1,0 +1,47 @@
+# Release workflow (ADR 0001, D7): builds runtime + size artifacts, refuses
+# to publish if any budget is red, and attaches the measurement record as
+# the release's perf manifest.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # create releases
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      PERF_RUNNER: github-release
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install valgrind (budget gate needs iai)
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+      - name: Install wasm32 target (budget gate needs the wasm check)
+        run: rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Budget gate — no release on red budgets
+        run: cargo xtask perf check
+      - name: Build artifacts
+        run: |
+          cargo build --profile size -p bw-demo
+          cargo build --profile runtime -p bw-demo
+      - name: Measure record (perf manifest)
+        run: cargo xtask perf measure --out dist/perf-record.json --runner github-release
+      - name: Package
+        run: |
+          mkdir -p dist
+          VERSION=$(git describe --tags --always)
+          tar -czf "dist/bw-demo-${VERSION}.tar.gz" -C target/size bw-demo
+          cp target/runtime/bw-demo "dist/bw-demo-${VERSION}-runtime"
+      - name: Create release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --title "${GITHUB_REF_NAME}" --generate-notes
