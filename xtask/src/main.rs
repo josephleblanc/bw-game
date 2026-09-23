@@ -4,6 +4,7 @@
 mod budgets;
 mod perf;
 mod record;
+mod report;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

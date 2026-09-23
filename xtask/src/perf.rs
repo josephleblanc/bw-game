@@ -17,6 +17,7 @@ use crate::budgets::{self, Budgets, Level};
 use crate::record::{
     AllocMeasurement, BenchMeasurement, Config, Deps, Env, FrameMeasurement, Git, Record, Skip,
 };
+use crate::report;
 
 /// Headless-contract defaults (ADR 0001, D4; ADR 0003).
 const PERF_TICKS: &str = "600";
@@ -76,10 +77,7 @@ pub fn dispatch(args: &[String]) -> Result<u8> {
         }
         "dhat" => {
             let flags = parse_flags(rest, &["--scene", "--ticks", "--seed", "--top"])?;
-            let top: usize = flags
-                .get("--top")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8);
+            let top: usize = flags.get("--top").and_then(|v| v.parse().ok()).unwrap_or(8);
             dhat_pass(
                 flags.get("--scene").map(String::as_str),
                 flags
@@ -88,6 +86,18 @@ pub fn dispatch(args: &[String]) -> Result<u8> {
                     .unwrap_or(PERF_TICKS),
                 flags.get("--seed").map(String::as_str).unwrap_or(PERF_SEED),
                 top,
+            )?;
+            Ok(0)
+        }
+        "report" => {
+            let flags = parse_flags(rest, &["--records", "--since"])?;
+            let records_path = flags
+                .get("--records")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| workspace_root().join("perf"));
+            report::run(
+                &records_path,
+                flags.get("--since").map(String::as_str).unwrap_or("7d"),
             )?;
             Ok(0)
         }
@@ -104,7 +114,8 @@ fn print_usage() {
          cargo xtask perf measure [--profile <name>] [--out <file>] [--runner <name>]\n  \
          cargo xtask perf check [--budgets <file>] [--profile <name>]\n  \
          cargo xtask perf attribute [--top <n>] [--profile <name>]\n  \
-         cargo xtask perf dhat [--scene <id>] [--ticks <n>] [--seed <n>] [--top <n>]"
+         cargo xtask perf dhat [--scene <id>] [--ticks <n>] [--seed <n>] [--top <n>]\n  \
+         cargo xtask perf report [--records <path>] [--since <7d|30d|all>]"
     );
 }
 
@@ -132,7 +143,7 @@ fn default_runner() -> String {
 
 /// Workspace root, resolved from the compiled-in manifest dir so the
 /// commands work from any cwd under the repo.
-fn workspace_root() -> PathBuf {
+pub(crate) fn workspace_root() -> PathBuf {
     match Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
         Some(root) => root.to_path_buf(),
         None => PathBuf::from("."),
@@ -725,7 +736,7 @@ fn print_dhat_summary(
                 .collect()
         })
         .unwrap_or_default();
-    probes.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(b.0)));
+    probes.sort_by(|a, b| b.1.0.cmp(&a.1.0).then(a.0.cmp(b.0)));
     println!("   probes (measured window, top {top} by blocks):");
     for (name, (blocks, calls)) in probes.iter().take(top) {
         println!(
