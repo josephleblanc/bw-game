@@ -225,6 +225,59 @@ mod tests {
         }
     }
 
+    /// Headless route check (the pathfinding tier): every scene runs a
+    /// recorded corner-to-corner query; connected scenes must find the
+    /// route, and any route found must stay walkable and 4-adjacent —
+    /// the archipelago's islands may legitimately disconnect corners,
+    /// so its query is allowed to refuse.
+    #[test]
+    fn scene_routes_stay_walkable() {
+        use bw_core::map::Tile;
+        use bw_core::path::Pathfinder;
+        for (id, params) in SCENES {
+            let map = build_scene(params, 42);
+            let walkable_from = |z0: i32| -> Option<Tile> {
+                let (w, h) = (map.width() as i32, map.height() as i32);
+                for z in z0.clamp(0, h - 1)..h {
+                    for x in 0..w {
+                        let t = Tile { x, z };
+                        if map.walkable(t) {
+                            return Some(t);
+                        }
+                    }
+                }
+                None
+            };
+            let Some(start) = walkable_from(0) else {
+                continue;
+            };
+            let Some(goal) = walkable_from(map.height() as i32 / 2) else {
+                continue;
+            };
+            let mut pf = Pathfinder::new(&map);
+            let mut out = Vec::new();
+            let found = pf.find_path_into(&map, start, goal, &mut out);
+            if *id != "archipelago" {
+                assert!(found, "{id}: corner-to-corner must connect");
+            }
+            if found {
+                assert_eq!(
+                    out.first(),
+                    Some(&start),
+                    "{id}: route must start at the start"
+                );
+                assert_eq!(out.last(), Some(&goal), "{id}: route must reach the goal");
+                for pair in out.windows(2) {
+                    let d = (pair[0].x - pair[1].x).abs() + (pair[0].z - pair[1].z).abs();
+                    assert_eq!(d, 1, "{id}: non-adjacent hop");
+                }
+                for &t in &out {
+                    assert!(map.walkable(t), "{id}: route crossed unwalkable {t:?}");
+                }
+            }
+        }
+    }
+
     /// The channel means read like the scenes' climates — temperate
     /// meadow, tropical archipelago, hot badlands — and fertility is a
     /// fraction everywhere. The read side of the tile property

@@ -36,6 +36,7 @@ use bevy::ecs::prelude::*;
 use bevy::ecs::schedule::SystemSet;
 
 use bw_core::character::{Character, CharacterPose, MovementInput, Skeleton, circle_input};
+use bw_core::map::{Tile, tile_center};
 use bw_core::math::Vec3;
 use bw_core::time::SIM_DT;
 
@@ -141,6 +142,32 @@ const MOVE_TURN_GAIN: f32 = 6.0;
 /// Bearing error beyond which the figure halts and turns in place.
 const MOVE_TURN_HALT: f32 = std::f32::consts::FRAC_PI_2;
 
+/// Routed controller: walk an A* tile route (`bw_core::path`) waypoint
+/// by waypoint, then hold inert — the walker-integration half of the
+/// pathfinding tier in docs/maps/map-design.md. Steering is
+/// [`MoveTarget`]'s law; a waypoint releases when the figure is inside
+/// [`FOLLOW_ARRIVE`] of its tile center (the route's own start tile
+/// releases the same way on the first tick). An arrived route stays as
+/// an inert component — the fixed-step systems take no `Commands`
+/// (ADR 0004); re-sends and cancels replace the component in `Update`.
+#[derive(Component)]
+pub struct FollowPath {
+    /// The full route, start tile included.
+    pub tiles: Vec<Tile>,
+    /// Index of the waypoint being walked; only the controller
+    /// advances it.
+    next: usize,
+}
+
+impl FollowPath {
+    pub fn new(tiles: Vec<Tile>) -> Self {
+        Self { tiles, next: 0 }
+    }
+}
+
+/// Waypoint arrival radius (m) — [`MoveTarget`]'s read.
+pub const FOLLOW_ARRIVE: f32 = 0.30;
+
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
@@ -164,7 +191,13 @@ impl Plugin for CharacterMovementPlugin {
             .init_resource::<NextWalkerId>()
             .add_systems(
                 FixedUpdate,
-                (step_circle_paths, step_move_targets, step_walkers).chain(),
+                (
+                    step_circle_paths,
+                    step_move_targets,
+                    step_follow_paths,
+                    step_walkers,
+                )
+                    .chain(),
             )
             .add_systems(Update, sync_bones.in_set(MovementMirror));
     }
@@ -181,11 +214,32 @@ fn step_circle_paths(mut query: Query<(&CirclePath, &mut Walker)>) {
     }
 }
 
+/// The steering law point-to-point controllers share: turn toward the
+/// bearing (halting to pivot in place when more than a quarter-turn
+/// off), then walk at cruise speed. The bearing uses the character's
+/// own heading convention (+z at 0, `atan2(x, z)`), with the error
+/// wrapped to `−π..π` because heading is unbounded. Arrival is the
+/// caller's business.
+fn steer_toward(character: &Character, to: Vec3) -> MovementInput {
+    let bearing = to.x.atan2(to.z);
+    let err = (bearing - character.heading + std::f32::consts::PI)
+        .rem_euclid(std::f32::consts::TAU)
+        - std::f32::consts::PI;
+    MovementInput {
+        target_speed: if err.abs() > MOVE_TURN_HALT {
+            0.0
+        } else {
+            MOVE_TO_SPEED
+        },
+        turn_rate: (err * MOVE_TURN_GAIN).clamp(-MOVE_TURN, MOVE_TURN),
+        jump: false,
+        punch: false,
+        reach: false,
+    }
+}
+
 /// Point-to-point control: turn toward the bearing, walk, stop inside
-/// the arrival radius (then hold — see [`MoveTarget`]). The bearing
-/// uses the character's own heading convention (+z at 0,
-/// `atan2(x, z)`), with the error wrapped to `−π..π` because heading
-/// is unbounded.
+/// the arrival radius (then hold — see [`MoveTarget`]).
 #[alloc_probe]
 fn step_move_targets(mut query: Query<(&MoveTarget, &mut Walker)>) {
     for (target, mut walker) in &mut query {
@@ -198,21 +252,34 @@ fn step_move_targets(mut query: Query<(&MoveTarget, &mut Walker)>) {
             *input = MovementInput::default();
             continue;
         }
-        let bearing = to.x.atan2(to.z);
-        let err = (bearing - character.heading + std::f32::consts::PI)
-            .rem_euclid(std::f32::consts::TAU)
-            - std::f32::consts::PI;
-        *input = MovementInput {
-            target_speed: if err.abs() > MOVE_TURN_HALT {
-                0.0
+        *input = steer_toward(character, to);
+    }
+}
+
+/// Route-following control: release every waypoint already inside the
+/// arrival radius (this skips the route's own start tile on the first
+/// tick), steer toward the next waypoint's tile center with the shared
+/// law, and hold inert once the route is spent.
+#[alloc_probe]
+fn step_follow_paths(mut query: Query<(&mut FollowPath, &mut Walker)>) {
+    for (mut route, mut walker) in &mut query {
+        let Walker {
+            character, input, ..
+        } = &mut *walker;
+        while route.next < route.tiles.len() {
+            let c = tile_center(route.tiles[route.next]);
+            let (dx, dz) = (c.x - character.pos.x, c.z - character.pos.z);
+            if (dx * dx + dz * dz).sqrt() <= FOLLOW_ARRIVE {
+                route.next += 1;
             } else {
-                MOVE_TO_SPEED
-            },
-            turn_rate: (err * MOVE_TURN_GAIN).clamp(-MOVE_TURN, MOVE_TURN),
-            jump: false,
-            punch: false,
-            reach: false,
+                break;
+            }
+        }
+        let Some(&goal) = route.tiles.get(route.next) else {
+            *input = MovementInput::default();
+            continue;
         };
+        *input = steer_toward(character, tile_center(goal) - character.pos);
     }
 }
 
@@ -503,6 +570,119 @@ mod tests {
             "braking overshoot must stay bounded: {p:?}"
         );
         assert_eq!(w.character.speed, 0.0);
+        assert_eq!(w.input, MovementInput::default());
+    }
+
+    /// Routed control: an L-shaped tile route walks waypoint by
+    /// waypoint, ends standing at the final tile's center, eases to
+    /// idle, and holds inert (the component stays — no Commands in
+    /// FixedUpdate).
+    #[test]
+    fn follow_path_walks_the_route_and_holds_inert() {
+        let mut app = App::new();
+        app.add_plugins(CharacterMovementPlugin)
+            .insert_resource(WalkerSkeleton(Skeleton::humanoid()));
+        let skel = app.world().resource::<WalkerSkeleton>().0.clone();
+        let route: Vec<Tile> = [(2, 2), (3, 2), (4, 2), (4, 3), (4, 4)]
+            .iter()
+            .map(|&(x, z)| Tile { x, z })
+            .collect();
+        let start = tile_center(route[0]);
+        let walker = spawn_walker(
+            app.world_mut(),
+            &skel,
+            Character::new(start, 0.0),
+            MovementInput::default(),
+        );
+        app.world_mut()
+            .entity_mut(walker)
+            .insert(FollowPath::new(route));
+        for _ in 0..900 {
+            let _ = app.world_mut().try_run_schedule(FixedUpdate);
+            app.update();
+        }
+        let Some(w) = app.world().get::<Walker>(walker) else {
+            panic!("walker must stay alive");
+        };
+        let end = tile_center(Tile { x: 4, z: 4 });
+        let dist =
+            ((w.character.pos.x - end.x).powi(2) + (w.character.pos.z - end.z).powi(2)).sqrt();
+        assert!(dist < 0.35, "should stand at the route's end: dist {dist}");
+        assert!(
+            w.character.speed < 0.05,
+            "gait must ease to idle after the route: {}",
+            w.character.speed
+        );
+        assert_eq!(w.input, MovementInput::default());
+        assert!(
+            app.world().get::<FollowPath>(walker).is_some(),
+            "an arrived route holds inert, not despawned"
+        );
+        // And it stays put while the component remains.
+        for _ in 0..120 {
+            let _ = app.world_mut().try_run_schedule(FixedUpdate);
+            app.update();
+        }
+        let Some(w) = app.world().get::<Walker>(walker) else {
+            panic!("walker must stay alive");
+        };
+        let settled =
+            ((w.character.pos.x - end.x).powi(2) + (w.character.pos.z - end.z).powi(2)).sqrt();
+        assert!(settled < 0.35, "must hold the end: {settled}");
+    }
+
+    /// Waypoint release: the route's own tile releases on the first
+    /// tick, a mid-route spawn picks up from where it stands, and an
+    /// empty route is inert from the start.
+    #[test]
+    fn follow_path_releases_arrived_waypoints() {
+        let mut app = App::new();
+        app.add_plugins(CharacterMovementPlugin)
+            .insert_resource(WalkerSkeleton(Skeleton::humanoid()));
+        let skel = app.world().resource::<WalkerSkeleton>().0.clone();
+        let on_route = tile_center(Tile { x: 3, z: 2 });
+        let walker = spawn_walker(
+            app.world_mut(),
+            &skel,
+            Character::new(on_route, 0.0),
+            MovementInput::default(),
+        );
+        let route: Vec<Tile> = [(3, 2), (4, 2), (5, 2)]
+            .iter()
+            .map(|&(x, z)| Tile { x, z })
+            .collect();
+        app.world_mut()
+            .entity_mut(walker)
+            .insert(FollowPath::new(route));
+        let _ = app.world_mut().try_run_schedule(FixedUpdate);
+        app.update();
+        let Some(fp) = app.world().get::<FollowPath>(walker) else {
+            panic!("route must stay alive");
+        };
+        assert_eq!(fp.next, 1, "the tile underfoot releases immediately");
+        let Some(w) = app.world().get::<Walker>(walker) else {
+            panic!("walker must stay alive");
+        };
+        assert!(
+            w.input.target_speed > 0.0 || w.input.turn_rate != 0.0,
+            "must be steering toward the next waypoint"
+        );
+
+        // An empty route writes the idle input and never panics.
+        let idle = spawn_walker(
+            app.world_mut(),
+            &skel,
+            Character::new(Vec3::ZERO, 0.0),
+            MovementInput::default(),
+        );
+        app.world_mut()
+            .entity_mut(idle)
+            .insert(FollowPath::new(Vec::new()));
+        let _ = app.world_mut().try_run_schedule(FixedUpdate);
+        app.update();
+        let Some(w) = app.world().get::<Walker>(idle) else {
+            panic!("walker must stay alive");
+        };
         assert_eq!(w.input, MovementInput::default());
     }
 
