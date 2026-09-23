@@ -269,6 +269,10 @@ mod tests {
     }
 
     /// The golden render hash: the canonical meadow pins byte-for-byte.
+    /// Moves whenever the map's own golden checksum moves — the render
+    /// caption carries the map checksum as provenance, so a channel
+    /// landing repins both (repinned 2026-09-23 for temperature +
+    /// fertility).
     #[test]
     fn golden_render_hash_is_pinned() {
         let meta = RenderMeta {
@@ -278,7 +282,7 @@ mod tests {
         let svg = render_string(&meadow(42), &meta);
         assert_eq!(
             fnv1a(svg.as_bytes()),
-            0xAD57_E002_21FB_C7FA,
+            0x6F72_83DA_1147_9EE2,
             "render churned — retune intentionally and repin"
         );
     }

@@ -68,11 +68,49 @@ rebuild-matches-fresh test) are the precedent for the derived cache.
    above (0 = blocked; otherwise a terrain multiplier in fixed point,
    e.g. Soil 10, Stone 9). Rebuilt on any mutation; cheap enough at
    these sizes to rebuild whole rather than dirty-tile.
-4. Later channels, each its own array when it earns one: **qi /
-   spirit richness** per tile (the xianxia flavor — where spirit herbs
-   want to grow, what makes a site good for cultivation), **zones**
-   (player designations: grow, harvest, stockpile), and vegetation
-   with its own `SIM_DT` tick when regrowth exists.
+4. Later channels, each its own array when it earns one — see
+   [Tile channels](#tile-channels-the-property-pattern) for the law
+   and the recipe: **qi / spirit richness** per tile (the xianxia
+   flavor — where spirit herbs want to grow, what makes a site good
+   for cultivation), **zones** (player designations: grow, harvest,
+   stockpile), and vegetation with its own `SIM_DT` tick when regrowth
+   exists. Temperature and fertility landed 2026-09-23 as the first
+   two, proving the pattern.
+
+## Tile channels (the property pattern)
+
+A *channel* is a per-tile property the whole map owns at once:
+temperature, fertility, qi. The landed law (temperature and fertility
+are the reference implementations, and the
+`add-map-tile-property` skill encodes the recipe):
+
+- **One flat `Vec<T>` per channel** on `Map`, over the same row-major
+  index space — SoA, cache-friendly, allocated once at generation
+  (ADR 0004). The type follows semantics: `f32` for scalars with
+  units documented in the field's doc comment, small `#[repr(u8)]`
+  enums for categorical state, bitflags for orthogonal booleans. No
+  generic channel registry: each channel is explicit, and its
+  accessors stay concrete.
+- **Generated from noise when the property is a place, written by
+  events when it is gameplay.** Generation gets the next
+  `CH_*` stream id and only real tuning knobs in `GenParams` (a range
+  pinned by semantics — fertility is a fraction — needs none). Every
+  new `GenParams` field joins `checksum()` and the parameter-
+  sensitivity test; that is the tuning-churn tripwire.
+- **Reads are free and everywhere** (`*_at(tile) -> Option<T>`, `None`
+  out of bounds — fail closed). **Writes go through one mutator**
+  (`set_*(tile, value) -> bool`, false = out-of-bounds no-op) so the
+  checksum sees every change; gameplay systems call mutators from
+  `Update`-side events, never per fixed tick. If a channel ever feeds
+  a derived cache, its mutator rebuilds it — the `set_occupancy` →
+  cost-cache precedent.
+- **The checksum folds every channel** behind an 8-byte tag, f32
+  values through `to_bits` (mutators assert finiteness/range first,
+  so the digest stays well-defined). Golden hashes are repinned
+  deliberately, in the same commit that changed the law.
+- **Tests every channel carries**: determinism (covered by the whole-
+  map checksum pin), parameter sensitivity, fixed-seed character
+  bands, write round-trip checksum-exact, out-of-bounds fail-closed.
 
 ## Generation
 

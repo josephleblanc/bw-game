@@ -31,10 +31,13 @@ pub const SCENES: &[(&str, GenParams)] = &[
             scale: 8.0,
             stone_threshold: 0.60,
             water_fraction: 0.08,
+            temp_base_c: 15.0,
+            temp_span_c: 14.0,
+            temp_noise_c: 2.5,
         },
     ),
     // Islands: a wet budget, broader features, one octave less so the
-    // coastlines stay chunky.
+    // coastlines stay chunky — and a tropical, near-equatorial climate.
     (
         "archipelago",
         GenParams {
@@ -44,9 +47,12 @@ pub const SCENES: &[(&str, GenParams)] = &[
             scale: 5.0,
             stone_threshold: 0.68,
             water_fraction: 0.22,
+            temp_base_c: 24.0,
+            temp_span_c: 4.0,
+            temp_noise_c: 1.5,
         },
     ),
-    // Dry, paved: big slow stone masses, almost no water.
+    // Dry, paved: big slow stone masses, almost no water, hot.
     (
         "badlands",
         GenParams {
@@ -56,11 +62,14 @@ pub const SCENES: &[(&str, GenParams)] = &[
             scale: 10.0,
             stone_threshold: 0.48,
             water_fraction: 0.02,
+            temp_base_c: 28.0,
+            temp_span_c: 8.0,
+            temp_noise_c: 3.0,
         },
     ),
     // The control: the blank law as a scene — a provenance no
     // threshold reaches, so every tile is soil (equivalent to
-    // `Map::blank(64, 64)`, pinned by test).
+    // `Map::blank(64, 64)`, pinned by test); default climate.
     (
         "blank",
         GenParams {
@@ -70,6 +79,9 @@ pub const SCENES: &[(&str, GenParams)] = &[
             scale: 8.0,
             stone_threshold: 1.0,
             water_fraction: 0.0,
+            temp_base_c: 15.0,
+            temp_span_c: 14.0,
+            temp_noise_c: 2.5,
         },
     ),
 ];
@@ -91,13 +103,17 @@ pub fn build_scene(params: &GenParams, seed: u64) -> Map {
 /// What the headless pass reports: layer counts plus the map
 /// checksum. Walkable is tiles minus water (generated maps carry no
 /// occupancy — buildings are a later tier).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SceneSummary {
     pub tiles: usize,
     pub walkable: usize,
     pub soil: usize,
     pub stone: usize,
     pub water: usize,
+    /// Channel means over all tiles — the read side of the tile
+    /// property pattern, as the headless scenes see it.
+    pub mean_temperature_c: f32,
+    pub mean_fertility: f32,
     pub checksum: u64,
 }
 
@@ -105,6 +121,8 @@ pub fn summarize(map: &Map) -> SceneSummary {
     let mut soil = 0;
     let mut stone = 0;
     let mut water = 0;
+    let mut temp_sum = 0.0f32;
+    let mut fert_sum = 0.0f32;
     for z in 0..map.height() as i32 {
         for x in 0..map.width() as i32 {
             match map.terrain_at(Tile { x, z }) {
@@ -112,14 +130,19 @@ pub fn summarize(map: &Map) -> SceneSummary {
                 Some(Terrain::Stone) => stone += 1,
                 _ => water += 1,
             }
+            temp_sum += map.temperature_at(Tile { x, z }).unwrap_or(0.0);
+            fert_sum += map.fertility_at(Tile { x, z }).unwrap_or(0.0);
         }
     }
+    let tiles = map.tile_count().max(1) as f32;
     SceneSummary {
         tiles: map.tile_count(),
         walkable: map.walkable_count(),
         soil,
         stone,
         water,
+        mean_temperature_c: temp_sum / tiles,
+        mean_fertility: fert_sum / tiles,
         checksum: map.checksum(),
     }
 }
@@ -199,6 +222,47 @@ mod tests {
             let s = summarize(&build_scene(params, 7));
             assert_eq!(s.soil + s.stone + s.water, s.tiles, "{id}: layers leaked");
             assert_eq!(s.walkable, s.tiles - s.water, "{id}: walkability law");
+        }
+    }
+
+    /// The channel means read like the scenes' climates — temperate
+    /// meadow, tropical archipelago, hot badlands — and fertility is a
+    /// fraction everywhere. The read side of the tile property
+    /// pattern, exercised where the scenes live.
+    #[test]
+    fn summaries_carry_the_channel_means() {
+        let s = |id: &str| {
+            let params = scene_preset(id).unwrap_or_else(|| panic!("{id} scene"));
+            summarize(&build_scene(&params, 42))
+        };
+        let meadow = s("meadow");
+        let archipelago = s("archipelago");
+        let badlands = s("badlands");
+        assert!(
+            (15.0..=29.0).contains(&meadow.mean_temperature_c),
+            "meadow mean temperature {}",
+            meadow.mean_temperature_c
+        );
+        assert!(
+            archipelago.mean_temperature_c > meadow.mean_temperature_c,
+            "archipelago should outrank the meadow"
+        );
+        assert!(
+            badlands.mean_temperature_c > archipelago.mean_temperature_c,
+            "badlands should be the hottest"
+        );
+        let blank = s("blank");
+        for (id, sum) in [
+            ("meadow", meadow),
+            ("archipelago", archipelago),
+            ("badlands", badlands),
+            ("blank", blank),
+        ] {
+            assert!(
+                (0.0..=1.0).contains(&sum.mean_fertility),
+                "{id} mean fertility {} not a fraction",
+                sum.mean_fertility
+            );
         }
     }
 

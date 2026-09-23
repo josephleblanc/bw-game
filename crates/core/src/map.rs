@@ -148,6 +148,14 @@ pub struct GenParams {
     /// Approximate water coverage, `[0, 1]`: water where the water
     /// channel pools above `1 - water_fraction`.
     pub water_fraction: f32,
+    /// Temperature at the z = 0 (north) edge, °C. The channel gradients
+    /// to `temp_base_c + temp_span_c` at the south edge, plus noise.
+    pub temp_base_c: f32,
+    /// North→south temperature span, °C — the map's latitude sweep.
+    pub temp_span_c: f32,
+    /// Temperature noise amplitude, °C — local variation around the
+    /// gradient.
+    pub temp_noise_c: f32,
 }
 
 impl Default for GenParams {
@@ -161,15 +169,22 @@ impl Default for GenParams {
             scale: 8.0,
             stone_threshold: 0.60,
             water_fraction: 0.08,
+            temp_base_c: 15.0,
+            temp_span_c: 14.0,
+            temp_noise_c: 2.5,
         }
     }
 }
 
-/// Noise channels: decorrelated lattice streams for stone shapes and
-/// water pools, keyed into the lattice hash (octaves spread each
-/// channel across further streams: `channel * 64 + octave`).
+/// Noise channels: decorrelated lattice streams for stone shapes,
+/// water pools, temperature variation, and fertility, keyed into the
+/// lattice hash (octaves spread each channel across further streams:
+/// `channel * 64 + octave`). New channels take the next id — the
+/// tile-property recipe (see the add-map-tile-property skill).
 const CH_STONE: u32 = 0;
 const CH_WATER: u32 = 1;
+const CH_TEMP: u32 = 2;
+const CH_FERT: u32 = 3;
 
 /// Random-access lattice value in `[0, 1)`: the splitmix64 avalanche
 /// (`sim::Rng`'s mixing law) applied to a pure coordinate hash, with
@@ -243,6 +258,15 @@ pub struct Map {
     height: u32,
     terrain: Vec<Terrain>,
     occupancy: Vec<Occupancy>,
+    /// Temperature per tile, °C — a north→south gradient plus noise.
+    /// The first scalar gameplay channel: written by generation and by
+    /// events (`set_temperature`), read by anything that cares about
+    /// climate. Folds into the checksum.
+    temperature: Vec<f32>,
+    /// Fertility per tile as a fraction in `(0, 1)` — noise, damped on
+    /// stone, near zero under water. No generation knobs: the range is
+    /// pinned by semantics (a fraction), not tuning.
+    fertility: Vec<f32>,
     /// Derived pathfinding cache: 0 = blocked, else the terrain cost in
     /// fixed point. Rebuilt by every mutation.
     cost: Vec<u8>,
@@ -299,6 +323,18 @@ impl Map {
             "water_fraction {} outside [0, 1]",
             params.water_fraction
         );
+        for (name, v) in [
+            ("temp_base_c", params.temp_base_c),
+            ("temp_span_c", params.temp_span_c),
+            ("temp_noise_c", params.temp_noise_c),
+        ] {
+            assert!(v.is_finite(), "{name} {v} must be finite");
+        }
+        assert!(
+            params.temp_noise_c >= 0.0,
+            "temp_noise_c {} must be non-negative",
+            params.temp_noise_c
+        );
         let mut map = Self {
             seed,
             params,
@@ -306,8 +342,13 @@ impl Map {
             height: params.height,
             terrain: Vec::with_capacity(tiles),
             occupancy: vec![Occupancy::EMPTY; tiles],
+            temperature: Vec::with_capacity(tiles),
+            fertility: Vec::with_capacity(tiles),
             cost: vec![0; tiles],
         };
+        // The temperature gradient's denominator: `(height - 1).max(1)`
+        // keeps single-row maps at the base temperature.
+        let grad = 1.0 / (map.height - 1).max(1) as f32;
         for z in 0..map.height as i32 {
             for x in 0..map.width as i32 {
                 // Sample at tile centers so no tile straddles a lattice
@@ -330,6 +371,20 @@ impl Map {
                     Terrain::Soil
                 };
                 map.terrain.push(terrain);
+                // Temperature: latitude gradient plus symmetric noise
+                // (`(fbm - 0.5) * 2` spans ±temp_noise_c around it).
+                let gradient = p.temp_base_c + p.temp_span_c * z as f32 * grad;
+                let noise = (fbm(seed, CH_TEMP, cx, cz, p.octaves, p.scale) - 0.5) * 2.0;
+                map.temperature.push(gradient + noise * p.temp_noise_c);
+                // Fertility: its own noise stream, damped by terrain —
+                // rock supports little, water nearly nothing.
+                let raw = fbm(seed, CH_FERT, cx, cz, p.octaves, p.scale);
+                let damped = match terrain {
+                    Terrain::Soil => raw,
+                    Terrain::Stone => raw * 0.60,
+                    Terrain::Water => raw * 0.10,
+                };
+                map.fertility.push(damped);
             }
         }
         map.rebuild_cost();
@@ -407,6 +462,54 @@ impl Map {
         }
     }
 
+    /// Temperature at a tile, °C (`None` out of bounds). Reads are free
+    /// from any system; writes go through `set_temperature` so the
+    /// checksum sees them.
+    pub fn temperature_at(&self, tile: Tile) -> Option<f32> {
+        self.index_of(tile).map(|i| self.temperature[i])
+    }
+
+    /// Event-driven temperature write (a campfire's warmth, a spell's
+    /// frost). Returns false — no-op — out of bounds. Nothing derives
+    /// from temperature yet, so there is no cache to rebuild; when a
+    /// consumer derives one, its rebuild belongs here (the
+    /// `set_occupancy` precedent).
+    pub fn set_temperature(&mut self, tile: Tile, celsius: f32) -> bool {
+        assert!(
+            celsius.is_finite(),
+            "temperature {celsius} must be finite — NaN would poison the checksum"
+        );
+        match self.index_of(tile) {
+            Some(i) => {
+                self.temperature[i] = celsius;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Fertility at a tile as a fraction in `(0, 1)` (`None` out of
+    /// bounds): how well plants would take to this ground.
+    pub fn fertility_at(&self, tile: Tile) -> Option<f32> {
+        self.index_of(tile).map(|i| self.fertility[i])
+    }
+
+    /// Event-driven fertility write (tilling, crop exhaustion). Returns
+    /// false — no-op — out of bounds.
+    pub fn set_fertility(&mut self, tile: Tile, fraction: f32) -> bool {
+        assert!(
+            (0.0..=1.0).contains(&fraction),
+            "fertility {fraction} outside [0, 1] — it is a fraction by law"
+        );
+        match self.index_of(tile) {
+            Some(i) => {
+                self.fertility[i] = fraction;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Derive the cost cache from terrain + occupancy, whole.
     fn rebuild_cost(&mut self) {
         for ((c, &t), &o) in self.cost.iter_mut().zip(&self.terrain).zip(&self.occupancy) {
@@ -420,8 +523,9 @@ impl Map {
 
     /// Digest of provenance + layers, the sim checksum's FNV law. Same
     /// `(seed, params, mutations)` → same checksum; any generation
-    /// parameter, terrain byte, or occupancy byte moves it. Layer tags
-    /// keep the two byte streams from aliasing.
+    /// parameter or layer value moves it. Layer tags keep the byte
+    /// streams from aliasing; f32 layers fold through `to_bits`
+    /// (deterministic for the finite values the mutators assert).
     pub fn checksum(&self) -> u64 {
         fn step(h: u64, v: u64) -> u64 {
             h.wrapping_mul(0x1000_0000_01B3) ^ v
@@ -434,6 +538,9 @@ impl Map {
         h = step(h, u64::from(self.params.scale.to_bits()));
         h = step(h, u64::from(self.params.stone_threshold.to_bits()));
         h = step(h, u64::from(self.params.water_fraction.to_bits()));
+        h = step(h, u64::from(self.params.temp_base_c.to_bits()));
+        h = step(h, u64::from(self.params.temp_span_c.to_bits()));
+        h = step(h, u64::from(self.params.temp_noise_c.to_bits()));
         h = step(h, u64::from_be_bytes(*b"TERRAIN0"));
         h = self.terrain.iter().fold(h, |h, t| step(h, *t as u64));
         h = step(h, u64::from_be_bytes(*b"OCCUPANC"));
@@ -441,6 +548,16 @@ impl Map {
             .occupancy
             .iter()
             .fold(h, |h, o| step(h, u64::from(o.bits())));
+        h = step(h, u64::from_be_bytes(*b"TEMPERAT"));
+        h = self
+            .temperature
+            .iter()
+            .fold(h, |h, v| step(h, u64::from(v.to_bits())));
+        h = step(h, u64::from_be_bytes(*b"FERTILIT"));
+        h = self
+            .fertility
+            .iter()
+            .fold(h, |h, v| step(h, u64::from(v.to_bits())));
         h
     }
 }
@@ -538,6 +655,18 @@ mod tests {
                 water_fraction: 0.12,
                 ..base
             },
+            GenParams {
+                temp_base_c: 16.0,
+                ..base
+            },
+            GenParams {
+                temp_span_c: 15.0,
+                ..base
+            },
+            GenParams {
+                temp_noise_c: 3.0,
+                ..base
+            },
             GenParams { width: 63, ..base },
             GenParams { height: 65, ..base },
         ];
@@ -553,13 +682,105 @@ mod tests {
 
     /// The golden hash: the default seed's exact map is contract now —
     /// any accidental change to the noise law, mixing constants, or
-    /// thresholds trips this pin.
+    /// thresholds trips this pin. Repinned 2026-09-23 when the
+    /// temperature and fertility channels joined the checksum.
     #[test]
     fn default_generation_checksum_is_pinned() {
         assert_eq!(
             Map::generate(42, GenParams::default()).checksum(),
-            0x3158_483A_1646_5E54
+            0x02AF_DE33_3145_E043
         );
+    }
+
+    /// The temperature channel is a climate, not static noise: the
+    /// north edge is cooler than the south edge (row means — the noise
+    /// averages out over a row), and every tile stays inside the
+    /// gradient-plus-noise envelope.
+    #[test]
+    fn temperature_gradients_southward_within_its_envelope() {
+        let p = GenParams::default();
+        let m = Map::generate(42, p);
+        let row_mean = |z: i32| {
+            let n = m.width() as f32;
+            (0..m.width() as i32)
+                .map(|x| m.temperature_at(Tile { x, z }).unwrap_or(f32::NAN))
+                .sum::<f32>()
+                / n
+        };
+        let north = row_mean(0);
+        let south = row_mean(m.height() as i32 - 1);
+        assert!(
+            south - north > p.temp_span_c * 0.8,
+            "gradient too weak: north {north}, south {south}"
+        );
+        for z in 0..m.height() as i32 {
+            for x in 0..m.width() as i32 {
+                let t = m.temperature_at(Tile { x, z }).unwrap_or(f32::NAN);
+                let gradient =
+                    p.temp_base_c + p.temp_span_c * z as f32 / (m.height() - 1).max(1) as f32;
+                assert!(
+                    (gradient - p.temp_noise_c..=gradient + p.temp_noise_c).contains(&t),
+                    "tile ({x}, {z}) at {t}°C escaped the envelope"
+                );
+            }
+        }
+    }
+
+    /// Fertility is a fraction damped by terrain: every value inside
+    /// (0, 1), and the mean on stone sits clearly under the mean on
+    /// soil, water clearly under both.
+    #[test]
+    fn fertility_is_a_fraction_and_respects_terrain() {
+        let m = Map::generate(42, GenParams::default());
+        let mut soil = (0.0f64, 0usize);
+        let mut stone = (0.0f64, 0usize);
+        let mut water = (0.0f64, 0usize);
+        for z in 0..m.height() as i32 {
+            for x in 0..m.width() as i32 {
+                let t = Tile { x, z };
+                let f = m.fertility_at(t).unwrap_or(f32::NAN);
+                assert!((0.0..=1.0).contains(&f), "fertility {f} not a fraction");
+                let bucket = match m.terrain_at(t) {
+                    Some(Terrain::Soil) => &mut soil,
+                    Some(Terrain::Stone) => &mut stone,
+                    _ => &mut water,
+                };
+                bucket.0 += f64::from(f);
+                bucket.1 += 1;
+            }
+        }
+        let mean = |b: (f64, usize)| b.0 / b.1.max(1) as f64;
+        assert!(mean(water) < mean(stone), "water out-ferts stone");
+        assert!(mean(stone) < mean(soil), "stone out-ferts soil");
+        assert!(
+            mean(water) < 0.10,
+            "water should be near-barren: {}",
+            mean(water)
+        );
+    }
+
+    /// Channel writes are event-driven and checksum-seen: a write
+    /// moves the checksum, writing the original value back restores it
+    /// exactly, and out-of-bounds writes no-op. Nothing derives from
+    /// these channels yet, so no cache is involved — the pin is the
+    /// contract for when one is.
+    #[test]
+    fn channel_writes_round_trip_checksum_exactly() {
+        let mut m = Map::generate(42, GenParams::default());
+        let t = Tile { x: 30, z: 30 };
+        let pristine = m.checksum();
+        let t0 = m.temperature_at(t).unwrap_or(f32::NAN);
+        let f0 = m.fertility_at(t).unwrap_or(f32::NAN);
+        assert!(m.set_temperature(t, t0 + 12.5), "in-bounds write");
+        assert_ne!(m.checksum(), pristine);
+        assert_eq!(m.temperature_at(t), Some(t0 + 12.5));
+        assert!(m.set_fertility(t, 0.05));
+        assert!(m.set_temperature(t, t0));
+        assert!(m.set_fertility(t, f0));
+        assert_eq!(m.checksum(), pristine, "restoring values restores the map");
+        assert!(!m.set_temperature(Tile { x: -1, z: 0 }, 0.0));
+        assert!(!m.set_fertility(Tile { x: 0, z: 99 }, 0.5));
+        assert_eq!(m.checksum(), pristine, "out-of-bounds writes are no-ops");
     }
 
     /// The water budget is monotone: raising the fraction can only
