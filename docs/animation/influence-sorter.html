@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bw-game — tone axes: influence sorter</title>
+<style>
+  :root {
+    --paper: #faf7f2; --ink: #2b2620; --muted: #8a8074;
+    --card: #ffffff; --line: #e5ded4;
+    --inf: #3a7d44; --inf-bg: #eef5ee;
+    --ctr: #b4552d; --ctr-bg: #f9efe8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--paper); color: var(--ink);
+    font: 15px/1.45 ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+    padding: 18px 22px 10px; border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 19px; margin: 0; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  header .spacer { flex: 1; }
+  button.btn {
+    font: inherit; font-size: 13px; padding: 5px 12px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--card); cursor: pointer;
+  }
+  button.btn:hover { border-color: var(--muted); }
+  #progress { font-size: 13px; color: var(--muted); }
+
+  .layout { display: flex; min-height: calc(100vh - 60px); }
+  nav {
+    width: 250px; flex: none; padding: 14px; border-right: 1px solid var(--line);
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  nav .axis-btn {
+    text-align: left; font: inherit; font-size: 14px; padding: 7px 10px;
+    border: none; background: none; border-radius: 8px; cursor: pointer;
+    display: flex; justify-content: space-between; align-items: center; gap: 8px;
+  }
+  nav .axis-btn:hover { background: #f1ece3; }
+  nav .axis-btn.on { background: var(--ink); color: var(--paper); }
+  nav .axis-btn .count {
+    font-size: 11px; color: var(--muted);
+    background: #f1ece3; border-radius: 99px; padding: 1px 7px;
+  }
+  nav .axis-btn.on .count { background: rgba(255,255,255,.2); color: var(--paper); }
+  nav .hint-line { color: var(--muted); font-size: 12px; margin: 4px 10px 10px; }
+
+  main { flex: 1; padding: 18px 22px; max-width: 1000px; }
+  .axis-head h2 { margin: 0 0 2px; font-size: 21px; }
+  .axis-head p { margin: 0 0 16px; color: var(--muted); font-size: 14px; }
+
+  .zones { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 860px) { .zones { grid-template-columns: 1fr; } nav { width: 200px; } }
+  .zone {
+    border: 2px dashed var(--line); border-radius: 12px; padding: 10px;
+    min-height: 92px; background: transparent;
+  }
+  .zone.over { border-style: solid; }
+  .zone[data-zone="inf"].over { border-color: var(--inf); background: var(--inf-bg); }
+  .zone[data-zone="ctr"].over { border-color: var(--ctr); background: var(--ctr-bg); }
+  .zone h3 {
+    margin: 2px 4px 8px; font-size: 12px; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--muted);
+    display: flex; justify-content: space-between;
+  }
+  .zone[data-zone="inf"] h3 span:first-child { color: var(--inf); }
+  .zone[data-zone="ctr"] h3 span:first-child { color: var(--ctr); }
+  .zone .empty { color: var(--muted); font-size: 13px; padding: 8px 6px; }
+  .zone .cards { display: flex; flex-wrap: wrap; gap: 6px; }
+
+  #poolWrap { margin-top: 18px; border: 2px dashed var(--line); border-radius: 12px; padding: 10px 12px; }
+  #poolWrap.over { border-color: var(--muted); border-style: solid; }
+  #poolWrap h3 { margin: 2px 4px 8px; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+  .group { margin: 8px 0 12px; }
+  .group h4 { margin: 0 0 6px; font-size: 13px; color: var(--muted); font-weight: 600; }
+  .group .cards { display: flex; flex-wrap: wrap; gap: 6px; }
+
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+    padding: 5px 10px; font-size: 14px; cursor: grab; user-select: none;
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  .card:hover { box-shadow: 0 1px 4px rgba(43,38,32,.15); }
+  .card:active { cursor: grabbing; }
+  .zone[data-zone="inf"] .card { border-left: 3px solid var(--inf); }
+  .zone[data-zone="ctr"] .card { border-left: 3px solid var(--ctr); }
+  .card .rm {
+    border: none; background: none; color: var(--muted); cursor: pointer;
+    font-size: 13px; padding: 0 0 0 2px; line-height: 1;
+  }
+  .card .rm:hover { color: var(--ctr); }
+
+  .notesWrap { margin-top: 18px; }
+  .notesWrap label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+  textarea#notes {
+    width: 100%; min-height: 64px; resize: vertical; font: inherit; font-size: 14px;
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: var(--card); color: var(--ink);
+  }
+  .addRow { display: flex; gap: 8px; margin-top: 10px; }
+  .addRow input {
+    flex: 1; font: inherit; font-size: 14px; border: 1px solid var(--line);
+    border-radius: 8px; padding: 6px 10px; background: var(--card); color: var(--ink);
+  }
+
+  #modal {
+    position: fixed; inset: 0; background: rgba(43,38,32,.45); display: none;
+    align-items: center; justify-content: center; padding: 20px;
+  }
+  #modal.open { display: flex; }
+  #modal .box {
+    background: var(--paper); border-radius: 12px; padding: 18px; width: 720px; max-width: 100%;
+    max-height: 85vh; display: flex; flex-direction: column; gap: 10px;
+  }
+  #modal textarea {
+    width: 100%; height: 55vh; resize: none; font: 12.5px/1.5 ui-monospace, monospace;
+    border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: var(--card); color: var(--ink);
+  }
+  #modal .row { display: flex; gap: 8px; justify-content: flex-end; }
+
+  footer { color: var(--muted); font-size: 12px; padding: 12px 22px 20px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>bw-game · tone axes</h1>
+  <span class="sub">sort influences per axis — unplayed games just stay in the pool</span>
+  <span class="spacer"></span>
+  <span id="progress"></span>
+  <button class="btn" id="exportBtn">Export markdown</button>
+  <button class="btn" id="resetBtn">Reset</button>
+</header>
+
+<div class="layout">
+  <nav id="nav"></nav>
+  <main>
+    <div class="axis-head" id="axisHead"></div>
+    <div class="zones">
+      <div class="zone" data-zone="inf">
+        <h3><span>✓ influence — pull from</span><span class="n"></span></h3>
+        <div class="cards"></div>
+        <div class="empty">drag games here — or click a card anywhere to cycle: influence → counter → off</div>
+      </div>
+      <div class="zone" data-zone="ctr">
+        <h3><span>✗ counter-influence — push against</span><span class="n"></span></h3>
+        <div class="cards"></div>
+        <div class="empty">drag games here</div>
+      </div>
+    </div>
+    <div id="poolWrap">
+      <h3>pool — not played / no strong feeling</h3>
+      <div id="poolGroups"></div>
+      <div class="addRow">
+        <input id="addInput" placeholder="add a game I missed…">
+        <button class="btn" id="addBtn">Add</button>
+      </div>
+    </div>
+    <div class="notesWrap">
+      <label for="notes">notes for this axis — tone words, gripes, references (saved with everything else)</label>
+      <textarea id="notes"></textarea>
+    </div>
+  </main>
+</div>
+
+<footer>
+  Autosaves to this browser while the file stays at this path. The exported markdown is the durable copy —
+  paste it back into the session when the sort is done.
+</footer>
+
+<div id="modal">
+  <div class="box">
+    <textarea id="modalText" readonly></textarea>
+    <div class="row">
+      <button class="btn" id="selectBtn">Select all</button>
+      <button class="btn" id="downloadBtn">Download influences.md</button>
+      <button class="btn" id="closeBtn">Close</button>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+const KEY = "bw-influence-sort-v1";
+
+const AXES = [
+  { id: "fluency",   name: "Path fluency",      hint: "Corner-cutting arcs vs. hugging tile centers — the stair-shuffle axis. Freedom of movement." },
+  { id: "agility",   name: "Agility",           hint: "Command latency; turns in stride vs. plant-and-rotate. Sprite agility." },
+  { id: "weight",    name: "Weight",            hint: "The impression of mass — starts, stops, momentum. Lumbering = heavy + slow to respond." },
+  { id: "gait",      name: "Gait identity",     hint: "What the walk cycle says about who this is — scholar mince, sword stride, child bob." },
+  { id: "idle",      name: "Idle & reaction life", hint: "Idle shifts, look-ats, flinches. Statues between orders = wrong." },
+  { id: "readable",  name: "Glance readability", hint: "Who is doing what, from the tactical camera, without UI help." },
+  { id: "camera",    name: "Camera temperament", hint: "Pan damping, follow lead, snap vs. ease (the angles themselves are already law)." },
+  { id: "pace",      name: "World pace",        hint: "Day length, contemplation vs. crisis — and how far players may subvert the base pace (ACS turtle vs. talisman bull). Figures must read from trudge to sprint." },
+  { id: "agency",    name: "Agent presence & autonomy", hint: "LLM-driven characters: how visibly they think — initiative, speech, idiosyncrasy — while staying glance-readable. No existing game does this fully; partial anchors only." },
+  { id: "dm",        name: "Directoredness (the DM)", hint: "How visibly the world bends to narrative — event and conflict pacing, authored vs. simulated feel. RimWorld's storyteller and L4D's AI Director are the mechanical ancestors." },
+];
+
+const GROUPS = [
+  ["Colony & builder sims", [
+    "Amazing Cultivation Simulator", "RimWorld", "Oxygen Not Included", "Dwarf Fortress",
+    "Factorio", "Stonehearth", "Timberborn", "Going Medieval", "Songs of Syx",
+    "Prison Architect", "Banished", "Frostpunk", "Kenshi", "They Are Billions",
+  ]],
+  ["Management classics", [
+    "Theme Hospital", "Two Point Hospital", "Dungeon Keeper 2", "Stronghold",
+  ]],
+  ["Life & farming sims", [
+    "The Sims", "Animal Crossing", "Stardew Valley",
+  ]],
+  ["Tactics & RTS", [
+    "Into the Breach", "XCOM 2", "Fire Emblem (any)", "Final Fantasy Tactics",
+    "Baldur's Gate II", "Invisible Inc", "Advance Wars", "Age of Empires II",
+    "Warcraft III", "StarCraft", "Northgard",
+  ]],
+  ["Action & platformers", [
+    "Hades", "Dead Cells", "Hollow Knight", "Celeste", "Hyper Light Drifter",
+    "Hotline Miami", "Enter the Gungeon", "Metal Slug", "Tunic",
+    "Monster Hunter (World/Rise)", "Dark Souls / Elden Ring", "Shadow of the Colossus",
+    "Sifu", "A Short Hike", "Journey",
+  ]],
+  ["Modern open-world movement", [
+    "Zelda: Breath of the Wild", "Genshin Impact", "Wuthering Waves",
+  ]],
+  ["Sprite-era movement", [
+    "Super Mario World", "Sonic (2D)", "Pokémon (2D)", "Prince of Persia (classic)",
+    "Crypt of the NecroDancer", "Diablo II",
+  ]],
+  ["AI-driven worlds (partial anchors)", [
+    "Left 4 Dead 2", "Wildermyth", "S.T.A.L.K.E.R. (A-Life)", "AI Dungeon", "Spore",
+  ]],
+];
+
+// ---------- state ----------
+
+let state = load();
+function fresh() { return { custom: [], perAxis: {} }; }
+function load() {
+  try {
+    const raw = localStorage.getItem(KEY);
+    if (!raw) return fresh();
+    const s = JSON.parse(raw);
+    if (!s || typeof s !== "object" || !s.perAxis) return fresh();
+    if (!Array.isArray(s.custom)) s.custom = [];
+    return s;
+  } catch { return fresh(); }
+}
+function save() { localStorage.setItem(KEY, JSON.stringify(state)); }
+function axisState(id) {
+  if (!state.perAxis[id]) state.perAxis[id] = { inf: [], ctr: [], notes: "" };
+  const st = state.perAxis[id];
+  if (!Array.isArray(st.inf)) st.inf = [];
+  if (!Array.isArray(st.ctr)) st.ctr = [];
+  if (typeof st.notes !== "string") st.notes = "";
+  return st;
+}
+
+const slug = (name) => name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+function allGames() {
+  const list = [];
+  for (const [group, names] of GROUPS) for (const n of names) list.push({ id: slug(n), name: n, group, custom: false });
+  for (const c of state.custom) list.push({ id: c.id, name: c.name, group: "Added by you", custom: true });
+  return list;
+}
+const GAME_MAP = () => Object.fromEntries(allGames().map(g => [g.id, g]));
+
+let current = AXES[0].id;
+
+// ---------- placement ----------
+
+function place(id, zone) { // zone: "inf" | "ctr" | "pool"
+  const st = axisState(current);
+  st.inf = st.inf.filter(x => x !== id);
+  st.ctr = st.ctr.filter(x => x !== id);
+  if (zone === "inf") st.inf.push(id);
+  if (zone === "ctr") st.ctr.push(id);
+  save(); renderMain(); renderNav();
+}
+function cycle(id) {
+  const st = axisState(current);
+  if (st.inf.includes(id)) place(id, "ctr");
+  else if (st.ctr.includes(id)) place(id, "pool");
+  else place(id, "inf");
+}
+function removeCustom(id) {
+  state.custom = state.custom.filter(c => c.id !== id);
+  for (const a of Object.values(state.perAxis)) {
+    a.inf = (a.inf || []).filter(x => x !== id);
+    a.ctr = (a.ctr || []).filter(x => x !== id);
+  }
+  save(); renderMain(); renderNav();
+}
+
+// ---------- render ----------
+
+const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+function cardEl(g, map) {
+  const el = document.createElement("div");
+  el.className = "card";
+  el.draggable = true;
+  el.dataset.id = g.id;
+  el.textContent = g.name;
+  if (g.custom) {
+    const rm = document.createElement("button");
+    rm.className = "rm"; rm.title = "remove"; rm.textContent = "×";
+    rm.addEventListener("click", (e) => { e.stopPropagation(); removeCustom(g.id); });
+    el.appendChild(rm);
+  }
+  el.addEventListener("click", () => cycle(g.id));
+  el.addEventListener("dragstart", (e) => {
+    e.dataTransfer.setData("text/plain", g.id);
+    e.dataTransfer.effectAllowed = "move";
+  });
+  return el;
+}
+
+function renderNav() {
+  const nav = document.getElementById("nav");
+  nav.innerHTML = "";
+  for (const a of AXES) {
+    const st = state.perAxis[a.id];
+    const n = st ? st.inf.length + st.ctr.length : 0;
+    const b = document.createElement("button");
+    b.className = "axis-btn" + (a.id === current ? " on" : "");
+    b.innerHTML = `<span>${esc(a.name)}</span>` + (n ? `<span class="count">${n}</span>` : "");
+    b.addEventListener("click", () => { current = a.id; renderMain(); renderNav(); });
+    nav.appendChild(b);
+  }
+  const hint = document.createElement("div");
+  hint.className = "hint-line";
+  hint.textContent = "one axis at a time — placements are per-axis, a game can appear on many";
+  nav.appendChild(hint);
+
+  const started = AXES.filter(a => { const st = state.perAxis[a.id]; return st && st.inf.length + st.ctr.length > 0; }).length;
+  document.getElementById("progress").textContent = `${started} / ${AXES.length} axes started`;
+}
+
+function renderMain() {
+  const axis = AXES.find(a => a.id === current);
+  const st = axisState(current);
+  const map = GAME_MAP();
+
+  document.getElementById("axisHead").innerHTML =
+    `<h2>${esc(axis.name)}</h2><p>${esc(axis.hint)}</p>`;
+
+  for (const zoneEl of document.querySelectorAll(".zone")) {
+    const zone = zoneEl.dataset.zone;
+    const list = zone === "inf" ? st.inf : st.ctr;
+    zoneEl.querySelector(".n").textContent = list.length || "";
+    const cards = zoneEl.querySelector(".cards");
+    cards.innerHTML = "";
+    for (const id of list) {
+      const g = map[id] || { id, name: id, custom: false };
+      cards.appendChild(cardEl(g, map));
+    }
+    zoneEl.querySelector(".empty").style.display = list.length ? "none" : "block";
+  }
+
+  const pool = document.getElementById("poolGroups");
+  pool.innerHTML = "";
+  const placed = new Set([...st.inf, ...st.ctr]);
+  const byGroup = new Map();
+  for (const g of allGames()) {
+    if (placed.has(g.id)) continue;
+    if (!byGroup.has(g.group)) byGroup.set(g.group, []);
+    byGroup.get(g.group).push(g);
+  }
+  for (const [group, games] of byGroup) {
+    const div = document.createElement("div");
+    div.className = "group";
+    const h = document.createElement("h4");
+    h.textContent = group;
+    div.appendChild(h);
+    const cards = document.createElement("div");
+    cards.className = "cards";
+    for (const g of games) cards.appendChild(cardEl(g, map));
+    div.appendChild(cards);
+    pool.appendChild(div);
+  }
+  if (!byGroup.size) pool.innerHTML = `<div class="group"><h4>everything is placed for this axis</h4></div>`;
+
+  const notes = document.getElementById("notes");
+  notes.value = st.notes;
+}
+
+// ---------- drops ----------
+
+function wireDrop(el, zone) {
+  el.addEventListener("dragover", (e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; el.classList.add("over"); });
+  el.addEventListener("dragleave", () => el.classList.remove("over"));
+  el.addEventListener("drop", (e) => {
+    e.preventDefault(); el.classList.remove("over");
+    const id = e.dataTransfer.getData("text/plain");
+    if (id && GAME_MAP()[id]) place(id, zone);
+  });
+}
+document.querySelectorAll(".zone").forEach(z => wireDrop(z, z.dataset.zone));
+wireDrop(document.getElementById("poolWrap"), "pool");
+
+// ---------- notes ----------
+
+document.getElementById("notes").addEventListener("input", (e) => {
+  axisState(current).notes = e.target.value; save();
+});
+
+// ---------- add game ----------
+
+function addCustom() {
+  const input = document.getElementById("addInput");
+  const name = input.value.trim();
+  if (!name) return;
+  const id = slug(name);
+  if (!id || GAME_MAP()[id]) { input.value = ""; return; }
+  state.custom.push({ id, name });
+  save(); input.value = ""; renderMain(); renderNav();
+}
+document.getElementById("addBtn").addEventListener("click", addCustom);
+document.getElementById("addInput").addEventListener("keydown", (e) => { if (e.key === "Enter") addCustom(); });
+
+// ---------- export ----------
+
+function exportMarkdown() {
+  const today = new Date().toISOString().slice(0, 10);
+  const lines = [`# Tone axes — influence sort (${today})`, ""];
+  for (const a of AXES) {
+    const st = axisState(a.id);
+    if (!st.inf.length && !st.ctr.length && !st.notes.trim()) continue;
+    lines.push(`## ${a.name}`);
+    lines.push(`_${a.hint}_`, "");
+    if (st.inf.length) lines.push(`**Influences:** ${st.inf.map(id => (GAME_MAP()[id] || { name: id }).name).join(", ")}`);
+    if (st.ctr.length) lines.push(`**Counter-influences:** ${st.ctr.map(id => (GAME_MAP()[id] || { name: id }).name).join(", ")}`);
+    if (st.notes.trim()) lines.push("", `Notes: ${st.notes.trim()}`);
+    lines.push("", "");
+  }
+  return lines.join("\n");
+}
+const modal = document.getElementById("modal");
+document.getElementById("exportBtn").addEventListener("click", () => {
+  document.getElementById("modalText").value = exportMarkdown();
+  modal.classList.add("open");
+});
+document.getElementById("closeBtn").addEventListener("click", () => modal.classList.remove("open"));
+modal.addEventListener("click", (e) => { if (e.target === modal) modal.classList.remove("open"); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") modal.classList.remove("open"); });
+document.getElementById("selectBtn").addEventListener("click", () => {
+  const t = document.getElementById("modalText");
+  t.focus(); t.select();
+});
+document.getElementById("downloadBtn").addEventListener("click", () => {
+  const blob = new Blob([exportMarkdown()], { type: "text/markdown" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "influences.md";
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+
+// ---------- reset ----------
+
+document.getElementById("resetBtn").addEventListener("click", () => {
+  if (!confirm("Clear every placement, note, and custom game?")) return;
+  state = fresh(); save(); renderMain(); renderNav();
+});
+
+// ---------- go ----------
+
+renderNav();
+renderMain();
+</script>
+</body>
+</html>
