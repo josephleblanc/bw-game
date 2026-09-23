@@ -20,6 +20,9 @@ use alloc_probe::alloc_probe;
 #[cfg(feature = "perf-alloc")]
 use bw_core::alloc_probe as alloc_probe_rt;
 
+#[cfg(feature = "perf-alloc")]
+use bw_core::gallery::alloc_detail;
+
 /// Counting allocator for the perf-alloc build. Declared by each
 /// measurement binary — not by bw-core — so the allocator stays a
 /// per-binary decision (see also `tests/steady_alloc.rs` in bw-core).
@@ -31,9 +34,10 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use bevy::prelude::*;
+#[cfg(feature = "perf-alloc")]
+use bw_core::gallery::AllocStats;
+use bw_core::gallery::{FrameStats, PerfReport};
 use bw_core::sim::{Sim, SpatialGrid};
-use bw_core::stats::five_number_summary;
-use serde::Serialize;
 
 /// Scene presets: the id fixes the entity count and arena.
 fn scene_preset(id: &str) -> Option<(usize, f32, f32)> {
@@ -168,102 +172,6 @@ fn sync_positions(state: Res<SimState>, mut query: Query<&mut Position>) {
         pos.x = state.sim.xs[i];
         pos.y = state.sim.ys[i];
     }
-}
-
-#[derive(Serialize)]
-struct FrameStats {
-    min: f64,
-    p50: f64,
-    p90: f64,
-    p99: f64,
-    max: f64,
-}
-
-impl FrameStats {
-    fn of(sample: Vec<f64>) -> Self {
-        let (min, p50, p90, p99, max) = five_number_summary(sample);
-        Self {
-            min,
-            p50,
-            p90,
-            p99,
-            max,
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct AllocStats {
-    count: u64,
-    peak_bytes: u64,
-}
-
-#[derive(Serialize)]
-struct WindowTotals {
-    blocks: u64,
-    bytes: u64,
-}
-
-#[derive(Serialize)]
-struct ProbeTotals {
-    blocks: u64,
-    bytes: u64,
-    calls: u64,
-    blocks_per_call: f64,
-    bytes_per_call: f64,
-}
-
-#[derive(Serialize)]
-struct MeasuredWindow {
-    blocks: u64,
-    bytes: u64,
-    ticks: u64,
-    blocks_per_tick: FrameStats,
-    bytes_per_tick: FrameStats,
-}
-
-#[derive(Serialize)]
-struct AllocDetail {
-    /// One-off cost: profiler creation through entity spawn (app + schedule
-    /// construction, scene seeding, archetype table growth).
-    setup: WindowTotals,
-    /// Warmup window: schedule-system initialization and first-run growth;
-    /// shares steady-state code paths.
-    warmup: WindowTotals,
-    /// The measured window: the steady-state churn the budget will gate.
-    measured: MeasuredWindow,
-    /// Per-function attribution, whole run (warmup + measured).
-    probes: std::collections::BTreeMap<String, ProbeTotals>,
-    /// Per-function attribution within the measured window only.
-    measured_probes: std::collections::BTreeMap<String, ProbeTotals>,
-    /// Everything inside a tick not attributed to a probed function: the
-    /// allocation debt inherited from the engine's schedule machinery.
-    schedule_residual: WindowTotals,
-    /// Live bytes at window boundaries: flat means no leak; drift is the
-    /// leak signal (per tick).
-    live: LiveBytes,
-}
-
-#[derive(Serialize)]
-struct LiveBytes {
-    start: u64,
-    end: u64,
-    drift_bytes_per_tick: f64,
-}
-
-#[derive(Serialize)]
-struct PerfReport {
-    scene: String,
-    ticks: u64,
-    warmup_ticks: u64,
-    seed: u64,
-    entities: usize,
-    interactions: u64,
-    state_checksum: String,
-    frame_ms: Option<FrameStats>,
-    allocs: Option<AllocStats>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    alloc_detail: Option<AllocDetail>,
 }
 
 fn main() {
@@ -412,96 +320,5 @@ fn main() {
             "{}",
             serde_json::to_string_pretty(&report).unwrap_or_default()
         );
-    }
-}
-
-/// Assemble the windowed/probed allocation report from the harness's
-/// boundary snapshots. Series are already per-tick samples in order.
-#[cfg(feature = "perf-alloc")]
-#[allow(clippy::too_many_arguments)]
-fn alloc_detail(
-    probes_before_window: &alloc_probe_rt::Registry,
-    probes_final: &alloc_probe_rt::Registry,
-    setup_totals: (u64, u64),
-    warmup_totals: (u64, u64),
-    measured_totals: (u64, u64),
-    live_start: u64,
-    live_end: u64,
-    tick_blocks: Vec<f64>,
-    tick_bytes: Vec<f64>,
-    ticks: u64,
-) -> AllocDetail {
-    fn probe_map(
-        source: &alloc_probe_rt::Registry,
-        calls: &alloc_probe_rt::Registry,
-    ) -> std::collections::BTreeMap<String, ProbeTotals> {
-        let mut map = std::collections::BTreeMap::new();
-        // `calls` carries the per-name call counts (identical in both
-        // snapshots for run-long probes; window entries use whole-run
-        // counts as the denominator).
-        for (name, (blocks, bytes, _)) in source {
-            let n = calls.get(name).map(|(_, _, c)| *c).unwrap_or(1) as f64;
-            map.insert(
-                (*name).to_string(),
-                ProbeTotals {
-                    blocks: *blocks,
-                    bytes: *bytes,
-                    calls: n as u64,
-                    blocks_per_call: *blocks as f64 / n,
-                    bytes_per_call: *bytes as f64 / n,
-                },
-            );
-        }
-        map
-    }
-
-    // Window-only probe attribution = final snapshot - pre-window snapshot.
-    let measured_probes_map = {
-        let mut window = alloc_probe_rt::Registry::new();
-        for (name, (fb, fby, fc)) in probes_final {
-            let before = probes_before_window.get(name).copied().unwrap_or((0, 0, 0));
-            window.insert(
-                name,
-                (
-                    fb.saturating_sub(before.0),
-                    fby.saturating_sub(before.1),
-                    fc.saturating_sub(before.2),
-                ),
-            );
-        }
-        window
-    };
-
-    let probe_blocks_in_window: u64 = measured_probes_map.values().map(|(b, _, _)| *b).sum();
-    let probe_bytes_in_window: u64 = measured_probes_map.values().map(|(_, by, _)| *by).sum();
-
-    let ticks_f = ticks.max(1) as f64;
-    AllocDetail {
-        setup: WindowTotals {
-            blocks: setup_totals.0,
-            bytes: setup_totals.1,
-        },
-        warmup: WindowTotals {
-            blocks: warmup_totals.0 - setup_totals.0,
-            bytes: warmup_totals.1 - setup_totals.1,
-        },
-        measured: MeasuredWindow {
-            blocks: measured_totals.0 - warmup_totals.0,
-            bytes: measured_totals.1 - warmup_totals.1,
-            ticks,
-            blocks_per_tick: FrameStats::of(tick_blocks),
-            bytes_per_tick: FrameStats::of(tick_bytes),
-        },
-        probes: probe_map(probes_final, probes_final),
-        measured_probes: probe_map(&measured_probes_map, probes_final),
-        schedule_residual: WindowTotals {
-            blocks: measured_totals.0 - warmup_totals.0 - probe_blocks_in_window,
-            bytes: measured_totals.1 - warmup_totals.1 - probe_bytes_in_window,
-        },
-        live: LiveBytes {
-            start: live_start,
-            end: live_end,
-            drift_bytes_per_tick: (live_end as f64 - live_start as f64) / ticks_f,
-        },
     }
 }

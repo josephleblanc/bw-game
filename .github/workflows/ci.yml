@@ -40,7 +40,7 @@ jobs:
       - name: Tests
         run: cargo test --workspace
       - name: WASM check
-        run: cargo check --target wasm32-unknown-unknown -p bw-core -p bw-demo
+        run: cargo check --target wasm32-unknown-unknown -p bw-core -p bw-demo -p bw-tree-gallery
       - name: Perf gates (measure + check)
         run: |
           set -o pipefail

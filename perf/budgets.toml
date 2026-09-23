@@ -11,7 +11,7 @@ reviewed = "2026-09-22"
 # Workspace members whose dependency graphs count toward the dep budget.
 # Tooling (xtask) stays out so its dependencies never count against the
 # game's footprint.
-measured_members = ["bw-core", "bw-demo"]
+measured_members = ["bw-core", "bw-demo", "bw-tree-gallery"]
 
 [artifact.bw-demo]
 # size-profile native binary, host target. Bevy minimal + sim core +
@@ -20,6 +20,13 @@ measured_members = ["bw-core", "bw-demo"]
 # 289,800 (no bevy), 1,030,544 (bevy, pre-gallery), 1,095,656 (hash grid).
 budget_bytes = 1110000
 note = "bevy 0.19.1 minimal + sim core + headless gallery harness (ADR 0002/0003/0004)"
+
+[artifact.bw-tree-gallery]
+# size-profile native binary, host target. Same dependency set as bw-demo
+# (no new external crates) plus the golden-ratio tree core and the tactical
+# SVG renderer. Measured 1,145,088 bytes at introduction.
+budget_bytes = 1170000
+note = "bevy 0.19.1 minimal + tree core + headless gallery harness + SVG render path (ADR 0002/0003/0004)"
 
 [deps]
 # 12 -> 78 external crates with bevy minimal (ADR 0002). Further raises are
@@ -58,6 +65,18 @@ note = "allocate-once rule; scratch sized to entity count at setup"
 [steady."bw-demo::bounce-big"]
 max_blocks_per_tick = 0
 note = "allocate-once rule; scratch sized to entity count at setup"
+
+[steady."bw-tree-gallery::tree"]
+max_blocks_per_tick = 0
+note = "allocate-once rule; pose buffers allocated per tree at setup"
+
+[steady."bw-tree-gallery::tree-storm"]
+max_blocks_per_tick = 0
+note = "allocate-once rule; same pose path as tree, stronger wind"
+
+[steady."bw-tree-gallery::tree-grove"]
+max_blocks_per_tick = 0
+note = "allocate-once rule; one reused pose buffer per tree in the grove"
 
 [advisory.build]
 # Compile-time trend threshold; never a hard gate (ADR 0001, D2).

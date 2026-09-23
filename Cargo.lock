@@ -463,7 +463,6 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 name = "bw-core"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "criterion",
  "dhat",
  "iai-callgrind",
@@ -476,10 +475,18 @@ name = "bw-demo"
 version = "0.1.0"
 dependencies = [
  "alloc-probe",
- "anyhow",
  "bevy",
  "bw-core",
- "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "bw-tree-gallery"
+version = "0.1.0"
+dependencies = [
+ "alloc-probe",
+ "bevy",
+ "bw-core",
  "serde_json",
 ]
 
