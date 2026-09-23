@@ -1,0 +1,43 @@
+[package]
+name = "bw-walker-gallery"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+bw-core.workspace = true
+alloc-probe.workspace = true # #[alloc_probe] attribute (ADR 0004); compile-time only
+bevy.workspace = true
+serde_json.workspace = true
+
+[features]
+# Allocation pass build (ADR 0003): separate build/run so the tracking
+# allocator never perturbs timing measurements (D8.8). Same feature
+# wiring as bw-demo / bw-tree-gallery; report types come from
+# bw_core::gallery.
+perf-alloc = ["bw-core/perf-alloc"]
+# walker-playground: the live 3D environment (backlog.md). Dev-only and
+# opt-in — turns on bevy's windowing/3D-pbr/text stack so the default
+# dependency graph, wasm gate, and size budgets stay untouched
+# (ADR 0002). The first `--features viewer` build compiles the 3D
+# pipeline (wgpu); expect a one-time longer compile.
+viewer = [
+  # LogPlugin: a dev viewer that swallows shader/wgpu errors is a
+  # debugging trap (found the hard way via a silent magenta screen).
+  "bevy/bevy_log",
+  "bevy/bevy_winit",
+  "bevy/x11",
+  "bevy/wayland",
+  "bevy/bevy_pbr",
+  # 2D sprite pipeline: the Text2d readout overlay (drawn by a second,
+  # non-clearing camera over the 3D scene).
+  "bevy/bevy_sprite_render",
+  "bevy/bevy_text",
+  "bevy/default_font",
+  # PNG encode: the --viewer-shot smoke saves screenshots to disk.
+  "bevy/png",
+]
+
+[lints]
+workspace = true

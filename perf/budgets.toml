@@ -11,7 +11,7 @@ reviewed = "2026-09-22"
 # Workspace members whose dependency graphs count toward the dep budget.
 # Tooling (xtask) stays out so its dependencies never count against the
 # game's footprint.
-measured_members = ["bw-core", "bw-demo", "bw-tree-gallery"]
+measured_members = ["bw-core", "bw-demo", "bw-tree-gallery", "bw-walker-gallery"]
 
 [artifact.bw-demo]
 # size-profile native binary, host target. Bevy minimal + sim core +
@@ -27,6 +27,14 @@ note = "bevy 0.19.1 minimal + sim core + headless gallery harness (ADR 0002/0003
 # SVG renderer. Measured 1,145,088 bytes at introduction.
 budget_bytes = 1170000
 note = "bevy 0.19.1 minimal + tree core + headless gallery harness + SVG render path (ADR 0002/0003/0004)"
+
+[artifact.bw-walker-gallery]
+# size-profile native binary, host target. Same dependency set as the other
+# galleries (no new external crates) plus the character core (vec3/quat +
+# procedural gait), the movement plugin, and the perspective-camera SVG
+# renderer. Measured 1,149,080 bytes at introduction.
+budget_bytes = 1180000
+note = "bevy 0.19.1 minimal + character core + movement plugin + headless gallery harness + 3D-projected SVG render path (ADR 0002/0003/0004)"
 
 [deps]
 # 12 -> 78 external crates with bevy minimal (ADR 0002). Further raises are
@@ -77,6 +85,30 @@ note = "allocate-once rule; same pose path as tree, stronger wind"
 [steady."bw-tree-gallery::tree-grove"]
 max_blocks_per_tick = 0
 note = "allocate-once rule; one reused pose buffer per tree in the grove"
+
+[steady."bw-walker-gallery::walk"]
+max_blocks_per_tick = 0
+note = "allocate-once rule; pose buffer pair per walker at spawn"
+
+[steady."bw-walker-gallery::walk-run"]
+max_blocks_per_tick = 0
+note = "allocate-once rule; same pose path as walk, run gait band"
+
+[steady."bw-walker-gallery::crowd"]
+max_blocks_per_tick = 0
+note = "allocate-once rule; one pose buffer pair per walker in the crowd"
+
+[steady."bw-walker-gallery::mandala-100"]
+max_blocks_per_tick = 0
+note = "allocate-once rule; mandala is the crowd path on ring choreography"
+
+[steady."bw-walker-gallery::mandala-1k"]
+max_blocks_per_tick = 0
+note = "allocate-once rule; same step/mirror path as crowd at 13k segments"
+
+[steady."bw-walker-gallery::mandala-10k"]
+max_blocks_per_tick = 0
+note = "allocate-once rule; stress tier — 130k segments, pose buffers at spawn only"
 
 [advisory.build]
 # Compile-time trend threshold; never a hard gate (ADR 0001, D2).

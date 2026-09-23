@@ -1,7 +1,7 @@
 [workspace]
 # xtask is a member (so `cargo run -p xtask` and `--workspace` see it) but not
 # a default target; reach it via the `cargo xtask` alias in .cargo/config.toml.
-members = ["crates/alloc-probe","crates/core","crates/demo","crates/tree-gallery","xtask"]
+members = ["crates/alloc-probe","crates/core","crates/demo","crates/tree-gallery","crates/walker-gallery","xtask"]
 default-members = ["crates/demo"]
 resolver = "2"
 
@@ -17,6 +17,7 @@ publish = false
 alloc-probe = {path = "crates/alloc-probe"} # probe-attribute macro (ADR 0004); no deps
 bw-demo = {path = "crates/demo"}
 bw-core = {path = "crates/core"}
+bw-walker-gallery = {path = "crates/walker-gallery"}
 
 # Other dependencies
 anyhow = "1.0"
